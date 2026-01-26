@@ -1,0 +1,18 @@
+// RUN: choreo -es %s 2>&1 | FileCheck %s
+
+__co__ void foo(int xx) {
+  global s32[1,2] g;
+  parallel by 1 : block {
+    a = dma.copy g => local;
+    b = dma.copy g => local;
+    c = dma.copy g => local;
+    foreach {idx} in [3]
+      y = select(idx + 1, a, b, c);
+    z = select(xx, a, b, c);
+  }
+}
+
+// CHECK: choreo::runtime_check((static_cast<long long>(idx) + 1{{(LL)?}} >= 0{{(LL)?}}), "The select factor ` (idx + 1) ` should be greater than or equal to 0, {{.*}}");
+// CHECK: choreo::runtime_check((static_cast<long long>(idx) + 1{{(LL)?}} < 3{{(LL)?}}), "The select factor ` (idx + 1) ` should be less than 3, which is the count of values in the select statement, {{.*}}");
+// CHECK: choreo::runtime_check((static_cast<long long>(xx) >= 0{{(LL)?}}), "The select factor `xx` should be greater than or equal to 0, {{.*}}");
+// CHECK: choreo::runtime_check((static_cast<long long>(xx) < 3{{(LL)?}}), "The select factor `xx` should be less than 3, which is the count of values in the select statement, {{.*}}");

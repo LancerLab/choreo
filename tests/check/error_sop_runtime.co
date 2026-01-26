@@ -1,0 +1,13 @@
+// RUN: choreo -es %s 2>&1 | FileCheck %s
+
+__co__ void foo(s32[N, M, K] input2) {
+  parallel p by 2, q by 4
+    foreach i in [16] {
+      dma.copy input2.chunkat(p, q, i).span_as(N/2*M/4, K/16) => local;
+      foreach j in [4]
+        dma.copy input2.chunkat(_, p, q).chunkat(_, j, i) => local;
+    }
+}
+
+// CHECK: warning: The reshape operation inside DMA expression maybe is executed on a noncontiguous tiling result.
+// CHECK: warning: There may have more than one tiling executed in noncontiguous manner.

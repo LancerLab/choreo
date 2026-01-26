@@ -1,0 +1,71 @@
+site_name: Choreo Tutorials
+site_url: http://127.0.0.1:8000
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.top
+    - search.highlight
+    - content.code.annotate
+
+docs_dir: Documents/Documentation
+
+extra_javascript:
+  - assets/js/highlight.min.js
+  - assets/js/choreo.js
+  - assets/js/bash.min.js
+
+extra_css:
+  - assets/css/github-dark.min.css
+  - assets/css/choreo.css
+
+markdown_extensions:
+  - codehilite:
+      guess_lang: false
+      css_class: highlight
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - What is Choreo: what-is-choreo.md
+  - Basics of Choreo-C++ Program:
+    - Choreo-C++ Program Structure: choreo-program-structure.md
+    - Shaped Data Manipulation:
+      - Shape and MDSpan: shape-in-choreo.md
+      - Integers and I-Tuples: integer-ituple.md
+      - Spanned Data and Buffers: spanned-data.md
+      - Dynamic Shape and Symbolic Dimension: symbolic-shape.md
+    - Loop Constructs and Parallel Execution:
+      - About Parallelism and Iterations: intro-loop-parallel.md
+      - SPMD Parallelism: parallel-in-choreo.md
+      - Loop Control: within-loops.md
+    - Chunk-Based Data Movement:
+      - The DMA Statement: basic-dma.md
+      - Tile Data with ChunkAt: tiling-chunkat.md
+    - Embeddings into C++ Code:
+      - Inputs and Output: input-output.md
+      - Invoke the Device Programs: call-in-choreo.md
+      - Macro and Preprocessing: macro-in-choreo.md
+    - Extending to the MPMD Programming:
+      - Thread Masking and Code Divergence: thread-masking.md
+      - (Experimental) Events for Asynchronous Execution: events.md
+      - (Experimental) More On Asynchronous Execution: general-async.md
+    - Advanced Features and Techniques:
+      - Advanced Data Movement: dma-in-advance.md
+      - Experimental Features: loop-in-advance.md
+    - Miscellaneous:
+      - Check Tileflow Program Statically: compiler-func.md
+      - Useful Utilities: assertion.md
+  - A Whirlwind Tour to Optimisation Patterns:
+    - Tileflow Optimisations: tileflow-opt.md
+    - Asynchoronous DMA transfer patterns with Choreo: async-dma-patterns.md
+    - Multi-buffering Patterns with Choreo: multi-buffering-patterns.md
+  - Reference Palette on Operators: operator-samples.md
+  - Design Rationales:
+    - Syntax Design of Choreo: syntax-design-of-choreo.md
+    - Why Symbolic Shapes: why-symbolic-shapes.md
+    - Design of Symbolic Evaluation System: value-numbering.md
+    - Dynaminism Support with Symbolic Representation: dynamic-design.md
+  - Contributing to Choreo: contribute.md
