@@ -32,3 +32,4 @@ extern/clang-format*
 
 !extern/Makefile
 !extern/cutlass
+!extern/gtest
