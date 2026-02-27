@@ -110,6 +110,17 @@ bool EarlySemantics::Visit(AST::MultiValues& n) {
     SetNodeType(n, MakeBoundedITupleType(Shape(dims)));
   }
 
+  if (n.HasNote("array_dims")) {
+    for (const auto& d : n.AllValues()) {
+      auto dty = d->GetType();
+      if (!isa<ScalarIntegerType>(dty))
+        Error1(d->LOC(), "Dimension of array can only be const integer "
+                         "value, but got value of type " +
+                             dty->TypeNameString() + ": " + PSTR(dty) + ".");
+    }
+    SetNodeType(n, MakeRankedArrayType(n.Count()));
+  }
+
   return true;
 }
 
@@ -173,8 +184,8 @@ bool EarlySemantics::Visit(AST::Expr& n) {
       return false;
     }
     if (auto sym = cast<AST::Expr>(n.GetR())->GetSymbol())
-      SetNodeType(n, SSTab().LookupSymbol(
-                         sym->name + (n.op == "mdataof" ? ".mdata" : ".data")));
+      SetNodeType(n, GetSymbolType(sym->name +
+                                   (n.op == "mdataof" ? ".mdata" : ".data")));
     else
       SetNodeType(n, MakeDummySpannedType());
   } else if (n.op == "addrof") {
@@ -268,7 +279,7 @@ bool EarlySemantics::Visit(AST::Expr& n) {
     } else if ((isa<MDSpanType>(lty) && isa<ITupleType>(rty)) ||
                (isa<MDSpanType>(rty) && isa<ITupleType>(lty))) {
       // mdspan + ituple
-      if (lty->Dims() != rty->Dims()) {
+      if (!CompatibleRank(lty->Dims(), rty->Dims())) {
         Error1(n.LOC(), "in operation \"" + n.op +
                             "\": dimension inconsistent (" +
                             std::to_string(lty->Dims()) + " vs. " +
@@ -285,7 +296,7 @@ bool EarlySemantics::Visit(AST::Expr& n) {
     } else if ((isa<ITupleType>(lty) && isa<ITupleType>(rty))) {
       // ituple + ituple
       if (lty->HasSufficientInfo() && rty->HasSufficientInfo()) {
-        if (lty->Dims() != rty->Dims()) {
+        if (!CompatibleRank(lty->Dims(), rty->Dims())) {
           Error1(n.LOC(), "in operation \"" + n.op +
                               "\": dimension inconsistent (" +
                               std::to_string(lty->Dims()) + " vs. " +
@@ -340,7 +351,7 @@ bool EarlySemantics::Visit(AST::Expr& n) {
       }
     } else if ((isa<BoundedITupleType>(lty) && isa<ITupleType>(rty)) ||
                (isa<BoundedITupleType>(rty) && isa<ITupleType>(lty))) {
-      if (lty->Dims() != rty->Dims()) {
+      if (!CompatibleRank(lty->Dims(), rty->Dims())) {
         Error1(n.LOC(), "in operation \"" + n.op +
                             "\": dimension inconsistent (" +
                             std::to_string(lty->Dims()) + " vs. " +
@@ -357,7 +368,7 @@ bool EarlySemantics::Visit(AST::Expr& n) {
         SetNodeType(n, MakeUnknownType());
         return false;
       }
-      if (lty->Dims() != rty->Dims()) {
+      if (!CompatibleRank(lty->Dims(), rty->Dims())) {
         Error1(n.LOC(), "in operation \"" + n.op +
                             "\": dimension inconsistent (" +
                             std::to_string(lty->Dims()) + " vs. " +
@@ -675,7 +686,7 @@ bool EarlySemantics::Visit(AST::AttributeExpr& n) {
       Error1(loop_iv->LOC(),
              "vectorization should be applied on an loop induction variable");
 
-    auto iv_ty = SSTab().LookupSymbol(loop_iv->name);
+    auto iv_ty = GetSymbolType(loop_iv->name);
     if (iv_ty) {
       if (auto bit = dyn_cast<BoundedITupleType>(iv_ty)) {
         if (bit->Dims() != 1)
@@ -1064,13 +1075,11 @@ bool EarlySemantics::Visit(AST::NamedVariableDecl& n) {
 bool EarlySemantics::Visit(AST::IntTuple& n) {
   TraceEachVisit(n);
   size_t dim_count = 0;
-  for (auto& v : n.GetValues()->AllValues()) {
-    if (auto itt = dyn_cast<ITupleType>(v->GetType())) {
+  for (auto& v : n.GetValues()->AllValues())
+    if (auto itt = dyn_cast<ITupleType>(v->GetType()))
       dim_count += itt->dim_count;
-    } else {
+    else
       ++dim_count;
-    }
-  }
 
   for (auto& v : n.GetValues()->AllValues()) {
     bool is_mutable = false;
@@ -1093,7 +1102,7 @@ bool EarlySemantics::Visit(AST::DataAccess& n) {
   auto dsym = RemoveSuffix(n.GetDataName(), ".data");
 
   if (!n.AccessElement()) {
-    SetNodeType(n, SSTab().LookupSymbol(dsym));
+    SetNodeType(n, GetSymbolType(dsym));
     return true;
   }
 
@@ -1102,7 +1111,7 @@ bool EarlySemantics::Visit(AST::DataAccess& n) {
     return false;
   }
 
-  auto dty = SSTab().LookupSymbol(n.GetDataName());
+  auto dty = GetSymbolType(n.GetDataName());
   auto sty = dyn_cast<SpannedType>(dty);
 
   if (!sty) {
@@ -1121,7 +1130,7 @@ bool EarlySemantics::Visit(AST::DataAccess& n) {
     idx_count += NodeType(*idx)->Dims();
   }
 
-  if (sty->Dims() != idx_count) {
+  if (!CompatibleRank(sty->Dims(), idx_count)) {
     Error1(n.LOC(),
            "accessing an spanned data (rank: " + std::to_string(sty->Dims()) +
                ") with " + std::to_string(idx_count) + " indices.");
@@ -1200,6 +1209,10 @@ bool EarlySemantics::Visit(AST::Assignment& n) {
       return false;
     }
 
+    if (auto e = dyn_cast<AST::Expr>(n.value);
+        e && isa<AST::ChunkAt>(e->GetReference()))
+      n.AddNote("ref");
+
     ReportErrorWhenViolateODR(n.LOC(), n.GetName(), __FILE__, __LINE__,
                               ShadowTypeStorage(sty));
 
@@ -1220,8 +1233,8 @@ bool EarlySemantics::Visit(AST::Assignment& n) {
     return true;
   }
 
-  auto vty = SSTab().LookupSymbol(n.GetName()); // variable type
-  auto ety = NodeType(*n.value);                // assignment expression type
+  auto vty = GetSymbolType(n.GetName()); // variable type
+  auto ety = NodeType(*n.value);         // assignment expression type
 
   // placeholder can be reassigned
   if (isa<PlaceHolderType>(vty)) {
@@ -1650,9 +1663,6 @@ bool EarlySemantics::Visit(AST::DMA& n) {
   }
 
   if (!n.future.empty()) {
-    size_t rank = sty->Dims();
-    assert(IsValidRank(rank));
-
     Storage sto = Storage::NONE;
     if (auto m = dyn_cast<AST::Memory>(n.to))
       sto = m->Get();
@@ -1669,17 +1679,20 @@ bool EarlySemantics::Visit(AST::DMA& n) {
       }
       ReportErrorWhenUseBeforeDefine(n.LOC(), n.future + ".span");
       ReportErrorWhenUseBeforeDefine(n.LOC(), n.future + ".data");
-      ModifySymbolType(n.future + ".span", MakeRankedMDSpanType(rank));
-      auto spanned_ty = MakeRankedSpannedType(rank, sty->ElementType(), sto);
+      auto spanned_ty = MakeRankedSpannedType(sty->GetShape().Rank(),
+                                              sty->ElementType(), sto);
       ModifySymbolType(n.future + ".data", spanned_ty);
+      ModifySymbolType(n.future + ".span",
+                       spanned_ty->GetMDSpanType()->Clone());
       if (n.IsSparse()) ModifySymbolType(n.future + ".mdata", spanned_ty);
       ModifySymbolType(n.future, MakeFutureType(spanned_ty, n.IsAsync()));
     } else {
-      ReportErrorWhenViolateODR(n.LOC(), n.future + ".span", __FILE__, __LINE__,
-                                MakeRankedMDSpanType(rank));
-      auto spanned_ty = MakeRankedSpannedType(rank, sty->ElementType(), sto);
+      auto spanned_ty = MakeRankedSpannedType(sty->GetShape().Rank(),
+                                              sty->ElementType(), sto);
       ReportErrorWhenViolateODR(n.LOC(), n.future + ".data", __FILE__, __LINE__,
                                 spanned_ty);
+      ReportErrorWhenViolateODR(n.LOC(), n.future + ".span", __FILE__, __LINE__,
+                                spanned_ty->GetMDSpanType()->Clone());
       if (n.IsSparse())
         ReportErrorWhenViolateODR(n.LOC(), n.future + ".mdata", __FILE__,
                                   __LINE__, spanned_ty);
@@ -1712,16 +1725,18 @@ bool EarlySemantics::Visit(AST::DMA& n) {
     }
 
   if (!isa<AST::Memory>(n.to)) {
-    if (sty->Dims() != tty->Dims() && !allow_auto_threading) {
+    if (!CompatibleRank(sty->Dims(), tty->Dims()) && !allow_auto_threading) {
       Error1(n.LOC(),
-             "The DMA statement contains a rank mismatch: the 'from' and 'to' "
-             "arrays have inconsistent dimensions.");
-    } else if (sty->ElementType() != tty->ElementType()) {
+             "DMA statement has a rank mismatch between 'from' and 'to': " +
+                 std::to_string(sty->Dims()) +
+                 " != " + std::to_string(tty->Dims()) + ".");
+    }
+    if (sty->ElementType() != tty->ElementType()) {
       Error1(n.LOC(),
-             "The DMA statement contains a type mismatch: the element types of "
+             "DMA statement contains a type mismatch: the element types of "
              "the 'from'(" +
                  STR(sty->ElementType()) + ") and 'to'(" +
-                 STR(tty->ElementType()) + ") arrays are inconsistent.");
+                 STR(tty->ElementType()) + ") are inconsistent.");
     }
   }
 
@@ -1732,15 +1747,23 @@ bool EarlySemantics::Visit(AST::DMA& n) {
       Error1(n.LOC(), "The DMA PAD config is incorrect. The correct form: "
                       "dma.pad(.async)<{pad_highs}, {pad_lows}, {pad_mids}, "
                       "padding value>.");
-    } else if (!((pcfg->pad_high->Count() == pcfg->pad_low->Count()) &&
-                 (pcfg->pad_low->Count() == pcfg->pad_mid->Count()))) {
-      Error1(n.LOC(),
-             "The DMA statement contains a rank mismatch: the paddings have "
-             "inconsistent ranks.");
-    } else if (NodeType(*n.from)->Dims() != pcfg->pad_high->Count()) {
-      Error1(n.LOC(),
-             "The rank of the data to transfer is inconsistent with the DMA "
-             "padding settings.");
+    } else if (pcfg->pad_high->Count() != pcfg->pad_low->Count() ||
+               (pcfg->pad_low->Count() != pcfg->pad_mid->Count())) {
+      if (pcfg->pad_high->Count() != pcfg->pad_low->Count())
+        Error1(n.LOC(), "DMA PAD statement has a rank mismatch between the "
+                        "pad-low and pad-high: " +
+                            std::to_string(pcfg->pad_low->Count()) + " != " +
+                            std::to_string(pcfg->pad_high->Count()) + ".");
+      if (pcfg->pad_low->Count() != pcfg->pad_mid->Count())
+        Error1(n.LOC(), "DMA PAD statement has a rank mismatch between the "
+                        "pad-low and pad-mid: " +
+                            std::to_string(pcfg->pad_low->Count()) + " != " +
+                            std::to_string(pcfg->pad_mid->Count()) + ".");
+    } else if (!CompatibleRank(NodeType(*n.from)->Dims(),
+                               pcfg->pad_high->Count())) {
+      Error1(n.LOC(), "DMA PAD statement has a rank mismatch: " +
+                          std::to_string(NodeType(*n.from)->Dims()) + " != " +
+                          std::to_string(pcfg->pad_high->Count()) + ".");
     }
 
     if (!isa<ScalarType>(NodeType(*pcfg->GetPadValue())))
@@ -1757,21 +1780,24 @@ bool EarlySemantics::Visit(AST::DMA& n) {
   if (n.operation == ".transp") {
     auto tcfg = dyn_cast<TransposeConfig>(n.config);
     if (!tcfg) {
-      Error1(n.LOC(),
-             "The DMA TRANSPOSE config is incorrect. The correct form: "
-             "dma.transp(.async)<dim0, dim1, ...>");
+      Error1(n.LOC(), "DMA TRANSPOSE config is incorrect. The correct form: "
+                      "dma.transp(.async)<dim0, dim1, ...>");
     } else {
       auto dim_values = tcfg->dim_values;
-      if (dim_values.size() != sty->Dims()) {
-        Error1(n.LOC(),
-               "The DMA statement contains a rank mismatch: the 'transpose "
-               "layout' and 'from' arrays have inconsistent dimensions.");
+      if (!CompatibleRank(dim_values.size(), sty->Dims())) {
+        Error1(n.LOC(), "DMA TRANSPOSE statement has a rank mismatch between "
+                        "the 'transpose "
+                        "layout' and 'from': " +
+                            std::to_string(dim_values.size()) +
+                            " != " + std::to_string(sty->Dims()) + ".");
       }
       if (!isa<AST::Memory>(n.to)) {
-        if (dim_values.size() != sty->Dims()) {
+        if (!CompatibleRank(dim_values.size(), sty->Dims())) {
           Error1(n.LOC(),
-                 "The DMA statement contains a rank mismatch: the 'transpose "
-                 "layout' and 'to' arrays have inconsistent dimensions.");
+                 "DMA TRANSPOSE statement has a rank mismatch: the 'transpose "
+                 "layout' and 'to': " +
+                     std::to_string(dim_values.size()) +
+                     " != " + std::to_string(sty->Dims()) + ".");
         }
       }
       std::sort(dim_values.begin(), dim_values.end());
@@ -1794,31 +1820,58 @@ bool EarlySemantics::Visit(AST::MMA& n) {
   switch (op.Tag()) {
   case AST::MMAOperation::Fill: {
     // MMA is a 2D operation
-    ReportErrorWhenViolateODR(n.LOC(), op.FillingSymbol(), __FILE__, __LINE__,
-                              MakeRankedSpannedType(2));
-    ReportErrorWhenViolateODR(n.LOC(), op.FillingSymbol() + ".span", __FILE__,
-                              __LINE__, MakeRankedMDSpanType(2));
-    if (!isa<ScalarType>(op.FillingValue()->GetType()))
-      Error1(n.LOC(), "Expect a scalar value for MMA fill.");
+    std::string fill_sym = FragName(op.FillingTo());
+    if (op.FillingIsDecl()) {
+      // `mc[1] = mma.fill 0;` is invalid.
+      assert(!AST::FragIsArrayElem(op.FillingTo()));
+      if (op.FillingArrayDims()) {
+        auto arr_type = cast<ArrayType>(op.FillingArrayDims()->GetType());
+        ReportErrorWhenViolateODR(
+            n.LOC(), fill_sym, __FILE__, __LINE__,
+            MakeRankedSpannedArrayType(2, arr_type->dims));
+      } else {
+        ReportErrorWhenViolateODR(n.LOC(), fill_sym, __FILE__, __LINE__,
+                                  MakeRankedSpannedType(2));
+      }
+      ReportErrorWhenViolateODR(n.LOC(), fill_sym + ".span", __FILE__, __LINE__,
+                                MakeRankedMDSpanType(2));
+      if (!isa<ScalarType>(op.FillingValue()->GetType()))
+        Error1(n.LOC(), "Expect a scalar value for MMA fill.");
+    } else {
+      ReportErrorWhenUseBeforeDefine(n.LOC(), fill_sym);
+    }
   } break;
   case AST::MMAOperation::Load: {
+    std::string fut_sym = AST::FragName(op.GetFuture());
+    assert(!AST::FragIsArrayElem(op.GetFuture()) &&
+           "For now, frag with indices is only supported for mc.");
     auto sty = dyn_cast<SpannedType>(op.LoadFrom()->GetType());
     if (!sty) Error1(n.LOC(), "Expected a spanned buffer for MMA load.");
     ReportErrorWhenViolateODR(
-        n.LOC(), op.GetFuture(), __FILE__, __LINE__,
+        n.LOC(), fut_sym, __FILE__, __LINE__,
         MakeFutureType(cast<SpannedType>(sty->Clone()), op.IsAsync()));
-    ReportErrorWhenViolateODR(n.LOC(), op.GetFuture() + ".span", __FILE__,
-                              __LINE__, cast<SpannedType>(sty->Clone()));
+    ReportErrorWhenViolateODR(n.LOC(), fut_sym + ".span", __FILE__, __LINE__,
+                              cast<SpannedType>(sty->Clone()));
   } break;
   case AST::MMAOperation::Exec: {
-    ReportErrorWhenUseBeforeDefine(n.LOC(), op.ExecOperand(0));
-    ReportErrorWhenUseBeforeDefine(n.LOC(), op.ExecOperand(1));
-    ReportErrorWhenUseBeforeDefine(n.LOC(), op.ExecOperand(2));
-    if (op.IsSparse() && !op.ExecOperand(3).empty())
-      ReportErrorWhenUseBeforeDefine(n.LOC(), op.ExecOperand(3));
+    std::string op0_sym = AST::FragName(op.ExecOperand(0));
+    std::string op1_sym = AST::FragName(op.ExecOperand(1));
+    std::string op2_sym = AST::FragName(op.ExecOperand(2));
+    ReportErrorWhenUseBeforeDefine(n.LOC(), op0_sym);
+    ReportErrorWhenUseBeforeDefine(n.LOC(), op1_sym);
+    ReportErrorWhenUseBeforeDefine(n.LOC(), op2_sym);
+    if (op.IsSparse() && op.ExecOperand(3)) {
+      std::string op3_sym = AST::FragName(op.ExecOperand(3));
+      ReportErrorWhenUseBeforeDefine(n.LOC(), op3_sym);
+    }
+    if (isa<ArrayType>(GetSymbolType(op0_sym)) &&
+        !AST::FragIsArrayElem(op.ExecOperand(0)))
+      Error1(op.ExecOperand(0)->LOC(),
+             "Cannot use the whole fragment array in mma exec operation.");
   } break;
   case AST::MMAOperation::Store: {
-    ReportErrorWhenUseBeforeDefine(n.LOC(), op.StoreFrom());
+    std::string sto_from_sym = AST::FragName(op.StoreFrom());
+    ReportErrorWhenUseBeforeDefine(n.LOC(), sto_from_sym);
     auto sty = op.StoreTo()->GetType();
     if (!isa<SpannedType>(sty))
       Error1(n.LOC(), "Expected a spanned buffer for MMA store.");
@@ -1830,32 +1883,6 @@ bool EarlySemantics::Visit(AST::MMA& n) {
 
 bool EarlySemantics::Visit(AST::ChunkAt& n) {
   TraceEachVisit(n);
-
-  for (auto tsi : n.AllOperations()) {
-    if (tsi->OpCode() == AST::SpannedOperation::RESHAPE) continue;
-    if (tsi->OpCode() == AST::SpannedOperation::TILING) continue;
-
-    // if notile has subscription rather than 0
-    std::vector<size_t> notile_indices;
-    size_t i = 0;
-    for (auto& v : tsi->GetTFSSNodes()) {
-      if (auto id = AST::GetIdentifier(v))
-        if (id->name == "__choreo_no_tiling__") {
-          notile_indices.push_back(i);
-          break;
-        }
-      ++i;
-    }
-
-    // the position index of notile must be 0
-    for (auto& i : notile_indices) {
-      auto il = GetIntLiteral(*tsi->PosAt(i));
-      if ((il == nullptr) || (il->Val() != 0))
-        Error1(tsi->PosAt(i)->LOC(), "subscription of '_' is " +
-                                         PSTR(tsi->PosAt(i)) +
-                                         " (0 is expected).");
-    }
-  }
 
   n.data->accept(*this);
   auto nty = NodeType(*n.data);
@@ -1869,70 +1896,68 @@ bool EarlySemantics::Visit(AST::ChunkAt& n) {
 
   auto sty = GetSpannedType(nty);
 
-  if (!IsValidRank(sty->Dims())) {
+  if (IsUnknownRank(sty->Dims())) {
     SetNodeType(n,
                 MakeUnRankedSpannedType(sty->ElementType(), sty->GetStorage()));
     return true;
   }
 
-  size_t rank = sty->Dims();
+  auto rank = sty->GetShape().Rank();
 
   for (auto op : n.AllOperations()) {
     op->accept(*this);
 
-    if (op->SpecifyReshape()) {
+    if (auto rop = dyn_cast<AST::SOP::Reshape>(op)) {
       size_t r_count = 0;
-      for (auto v : op->GetSANodes()) {
+      for (auto v : rop->GetNewSpan()->AllValues()) {
         auto ty = NodeType(*v);
         if (!CanYieldDimension(ty) && !isa<MDSpanType>(ty))
           Error1(v->LOC(), "the value (" + PSTR(ty) +
                                ") can not used for declaring a mdspan.");
-        r_count += ty->Dims();
+        if (IsValidRank(ty->Dims()) && IsValidRank(r_count))
+          r_count += ty->Dims();
       }
+      if (IsValidRank(r_count)) rank = r_count;
       // can not check further util shapeinfer is done
-      rank = r_count;
-      op->SetRank(rank);
       continue;
     }
 
-    size_t r_count = 0;
-    for (auto& v : op->GetIndices()) {
+    for (auto& v : op->IndexNodes()) {
       auto ty = NodeType(*v);
-      if (!op->MultipleExprs() && !isa<BoundedType>(ty)) {
-        Error1(v->LOC(), "expect '" + PSTR(v) +
-                             "` be a bounded type (but got " + PSTR(ty) + ").");
-      } else if (op->MultipleExprs() && !CanYieldIndex(ty))
+      if (!CanYieldIndex(ty))
         Error1(v->LOC(), "expect '" + PSTR(v) +
                              "` to yield an index (but got " + PSTR(ty) + ").");
-      r_count += ty->Dims();
       SetNodeType(*v, ty);
     }
-    // report error when the ranks do not match
-    if (rank != r_count)
-      Error1(op->LOC(), "un-matched ranks between spanned data (" +
-                            std::to_string(rank) + ") and bounded variables (" +
-                            std::to_string(r_count) + ").");
-
-    if (op->MultipleExprs()) {
-      size_t b_count = 0;
-      for (auto& v : op->GetTFSSNodes()) {
-        auto ty = NodeType(*v);
-        if (!isa<ScalarIntegerType>(ty) && !isa<ITupleType>(ty) &&
-            !isa<MDSpanType>(ty) && !isa<BoundedType>(ty))
-          Error1(v->LOC(), "expect '" + PSTR(v) +
-                               "` to be either an integer, ituple, mdspan type "
-                               "or bounded type (but got " +
-                               PSTR(ty) + ").");
-        b_count += ty->Dims();
-        SetNodeType(*v, ty);
-      }
-      if (rank != b_count)
-        Error1(op->LOC(), "un-matched ranks between spanned data (" +
-                              std::to_string(rank) + ") and " +
-                              STR(op->OpCode()) + " variables (" +
-                              std::to_string(b_count) + ").");
+    for (auto& v : op->TilingFactorNodes()) {
+      auto ty = NodeType(*v);
+      if (!IntegersOnly(ty))
+        Error1(v->LOC(), "expect '" + PSTR(v) +
+                             "` be a type with only integers (but got " +
+                             PSTR(ty) + ").");
+      SetNodeType(*v, ty);
     }
-    op->SetRank(rank);
+    for (auto& v : op->SubSpanNodes()) {
+      auto ty = NodeType(*v);
+      if (!isa<ScalarIntegerType>(ty) && !isa<ITupleType>(ty) &&
+          !isa<MDSpanType>(ty))
+        Error1(
+            v->LOC(),
+            "expect '" + PSTR(v) +
+                "` to be either an integer, ituple, or mdspan type (but got " +
+                PSTR(ty) + ").");
+      SetNodeType(*v, ty);
+    }
+    for (auto& v : op->OffsetNodes()) {
+      auto ty = NodeType(*v);
+      if (!isa<ScalarIntegerType>(ty) && !isa<ITupleType>(ty) &&
+          !isa<MDSpanType>(ty) && !isa<BoundedType>(ty))
+        Error1(v->LOC(), "expect '" + PSTR(v) +
+                             "` to be either an integer, ituple, mdspan type "
+                             "or bounded type (but got " +
+                             PSTR(ty) + ").");
+      SetNodeType(*v, ty);
+    }
   }
 
   SetNodeType(
@@ -2686,7 +2711,7 @@ bool EarlySemantics::ReportErrorWhenViolateODR(const location& loc,
     return false;
   }
   SSTab().DefineSymbol(name, type); // TODO: improve the type
-  VST_DEBUG(dbgs() << "Define Symbol '" << name << "' as: " << PSTR(type)
-                   << ".\n");
+  VST_DEBUG(dbgs() << "Define Symbol '" << InScopeName(name)
+                   << "' as: " << PSTR(type) << ".\n");
   return true;
 }

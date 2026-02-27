@@ -6,7 +6,7 @@
 using namespace Choreo;
 
 #ifndef __CHOREO_DEFAULT_TARGET__
-#error "no default target is specified."
+  #error "no default target is specified."
 #endif
 
 extern location loc;
@@ -52,6 +52,12 @@ Option<bool>
              "Remove all comments in non-choreo code. (Useful for FileCheck)");
 Option<bool> inf_type(OptionKind::User, "--infer-types", "-i", false,
                       "Show the result of type inference.");
+Option<bool> inf_ty_strd(OptionKind::User, "--infer-types-with-strides", "-ii",
+                         false,
+                         "Show the result of type inference (with strides).");
+Option<bool> show_strides(OptionKind::User, "--always-show-strides", "-ass",
+                          false,
+                          "Always show the strides when printing types.");
 Option<bool> pp_only(OptionKind::User, "-E", "", false,
                      "Preprocess only; do not compile.");
 Option<bool> no_pp(OptionKind::Hidden, "--no-preprocess", "-npp", false,
@@ -85,6 +91,9 @@ Option<bool> warning_as_error(OptionKind::User, "-Werror", "", false,
                               "Make all warnings into errors.");
 Option<bool> disable_runtime_check(OptionKind::User, "--disable-runtime-check",
                                    "", false, "Disable all runtime checks.");
+Option<bool> disable_cuda_runtime_env_check(
+    OptionKind::User, "--disable-cuda-runtime-env-check", "", false,
+    "Do not emit cuda runtime enviroment check.");
 
 Option<std::string>
     target_options(OptionKind::Hidden, "--target-options", "-tos", "",
@@ -269,7 +278,8 @@ bool CommandLine::Parse(int argc, char** argv) {
   CCtx().SetNoPreProcess(no_pp.GetValue());
   CCtx().SetDropComments(del_comm.GetValue());
   CCtx().SetDebugAll(debug_on.GetValue());
-  CCtx().SetShowInferredTypes(inf_type.GetValue());
+  CCtx().SetShowInferredTypes(inf_type.GetValue() || inf_ty_strd.GetValue());
+  CCtx().SetShowStrides(inf_ty_strd.GetValue() || show_strides.GetValue());
   CCtx().SetDumpSymtab(dump_sym.GetValue());
   CCtx().SetVisualize(visualiz.GetValue());
   CCtx().SetCrossCompile(cross_compile.GetValue());
@@ -289,6 +299,8 @@ bool CommandLine::Parse(int argc, char** argv) {
   CCtx().SetInhibitWarning(inhibit_warning.GetValue());
   CCtx().SetWarningAsError(warning_as_error.GetValue());
   CCtx().SetDisableRuntimeCheck(disable_runtime_check.GetValue());
+  CCtx().SetDisableCudaRuntimeEnvCheck(
+      disable_cuda_runtime_env_check.GetValue());
   CCtx().SetDebugFileDir(debug_file_dir.GetValue());
 
   if (!trace_visit.GetValue().empty())

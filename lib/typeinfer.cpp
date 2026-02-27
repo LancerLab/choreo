@@ -178,6 +178,23 @@ bool TypeInference::Visit(AST::MultiValues& n) {
   TraceEachVisit(n);
 
   if (in_template_param) in_template_param = false; // exit template param visit
+
+  if (n.HasNote("array_dims")) {
+    auto aty = cast<ArrayType>(NodeType(n));
+    for (size_t i = 0; i < aty->ArrayRank(); ++i) {
+      const auto& d = aty->Dimension(i);
+      if (VIIsInt(d)) {
+        if (*VIInt(d) <= 0)
+          Error1(n.ValueAt(i)->LOC(),
+                 "The array dimensions should be greater than 0, but got " +
+                     STR(d) + ".");
+      } else {
+        Error1(n.ValueAt(i)->LOC(), "The array dimensions should be static "
+                                    "(compile-time known), but got " +
+                                        STR(d) + ".");
+      }
+    }
+  }
   return true;
 }
 
@@ -228,10 +245,13 @@ bool TypeInference::Visit(AST::DataType& n) {
   // compound type
   if (auto mdspan = dyn_cast<AST::MultiDimSpans>(n.mdspan_type)) {
     auto shape = cast<MDSpanType>(mdspan->GetType())->GetShape();
-    if (n.isArray())
-      SetNodeType(n, MakeSpannedArrayType(n.base_type, shape, n.array_dims));
+    ValueList strides;
+    if (shape.IsValid()) strides = shape.GenDenseStrides();
+    if (n.IsArrayType())
+      SetNodeType(n, MakeStridedSpannedArrayType(n.base_type, shape, strides,
+                                                 n.ArrayDims()));
     else
-      SetNodeType(n, MakeSpannedType(n.getBaseType(), shape));
+      SetNodeType(n, MakeSpannedType(n.getBaseType(), shape, strides));
     cur_type = n.GetType();
   }
 
@@ -814,7 +834,7 @@ bool TypeInference::Visit(AST::SpanAs& n) {
   } else {
     auto fty =
         cast<SpannedType>(GetSymbolType(n.id->LOC(), n.id->name + ".data"));
-    SetNodeType(n, ShadowTypeStorage(MakeSpannedType(
+    SetNodeType(n, ShadowTypeStorage(MakeDenseSpannedType(
                        fty->e_type, sty->GetShape(), fty->GetStorage())));
     cur_type = n.GetType();
   }
@@ -846,7 +866,8 @@ bool TypeInference::Visit(AST::DMA& n) {
 
   // update the future type. fill info including storage, fundamental type
   auto fty = cast<FutureType>(n.GetType());
-  auto sty = MakeSpannedType(dma_fmty, fty->GetShape(), dma_mem);
+  auto sty =
+      MakeSpannedType(dma_fmty, fty->GetShape(), fty->GetStrides(), dma_mem);
   auto nty = MakeFutureType(sty, fty->IsAsync());
   n.SetType(nty);
 
@@ -881,63 +902,85 @@ bool TypeInference::Visit(AST::MMA& n) {
   auto& op = *n.GetOperation();
   switch (op.Tag()) {
   case AST::MMAOperation::Fill: {
-    auto fill_ty = MakeSpannedType(op.FillingType(), GenUninitShape());
-    // any usage of this symbol is illegal util the inference happens
-    AssignSymbolWithType(n.LOC(), op.FillingSymbol(), fill_ty);
-    AssignSymbolWithType(n.LOC(), op.FillingSymbol() + ".span",
-                         fill_ty->GetMDSpanType());
+    if (op.FillingIsDecl()) {
+      // any usage of this symbol is illegal util the inference happens
+      std::string fill_sym = FragName(op.FillingTo());
+      if (op.FillingArrayDims()) {
+        auto fill_ty = MakeUnRankedSpannedArrayType(
+            op.FillingType(),
+            GetArrayDimensions(op.FillingArrayDims()->GetType()));
+        AssignSymbolWithType(n.LOC(), fill_sym, fill_ty);
+        AssignSymbolWithType(n.LOC(), fill_sym + ".span",
+                             fill_ty->spty->GetMDSpanType());
+      } else {
+        auto fill_ty = MakeUnRankedSpannedType(op.FillingType());
+        AssignSymbolWithType(n.LOC(), fill_sym, fill_ty);
+        AssignSymbolWithType(n.LOC(), fill_sym + ".span",
+                             fill_ty->GetMDSpanType());
+      }
+    }
   } break;
   case AST::MMAOperation::Load: {
-    AssignSymbolWithType(n.LOC(), op.GetFuture(), n.GetType()->Clone());
+    std::string fut_sym = AST::FragName(op.GetFuture());
+    AssignSymbolWithType(n.LOC(), fut_sym, n.GetType()->Clone());
     auto sty = GetSpannedType(n.GetType());
     assert(sty && "expect a spanned type.");
-    AssignSymbolWithType(n.LOC(), op.GetFuture() + ".span",
+    AssignSymbolWithType(n.LOC(), fut_sym + ".span",
                          sty->GetMDSpanType()->Clone());
     if (CCtx().ShowInferredTypes()) {
-      dbgs() << "Future:    " << InScopeName(op.GetFuture())
+      dbgs() << "Future:    " << InScopeName(fut_sym)
              << ", Type: " << AST::TYPE_STR(n) << "\n";
     }
   } break;
   case AST::MMAOperation::Exec: {
-    auto acc_ty = GetSymbolType(n.LOC(), op.ExecOperand(0));
-    auto sty = GetSpannedType(acc_ty);
-    auto ety = sty->ElementType();
-    ptr<SpannedType> mc_ty = nullptr;
-    auto nsty = cast<SpannedType>(n.GetType());
+    const auto& acc = op.ExecOperand(0);
+    std::string acc_sym = AST::FragName(acc);
+    auto acc_ty = GetSymbolType(
+        acc->LOC(), acc_sym); // the type of sym, might be array type
+    auto acc_sty = GetSpannedType(acc_ty);
+    auto acc_ety = acc_sty->ElementType();
+    ptr<SpannedType> res_sty = nullptr; // the type after inference
+    auto nd_sty = cast<SpannedType>(n.GetType());
     // mc type is explicit annotated, set it
-    if (ety != BaseType::UNKSCALAR) {
-      auto shape = nsty->GetShape();
-      auto storage = sty->GetStorage();
-      mc_ty = MakeSpannedType(ety, shape, storage);
+    if (acc_ety != BaseType::UNKSCALAR) {
+      auto shape = nd_sty->GetShape();
+      auto storage = acc_sty->GetStorage();
+      res_sty = MakeDenseSpannedType(acc_ety, shape, storage);
     } else {
-      mc_ty = cast<SpannedType>(n.GetType());
+      res_sty = nd_sty;
     }
 
     // element type must be inferred
-    if (mc_ty->ElementType() == BaseType::UNKSCALAR) {
+    if (res_sty->ElementType() == BaseType::UNKSCALAR) {
       auto candidate_tys = MMALimit::InferResultType();
       if (candidate_tys.empty())
-        Error1(n.LOC(), "Failed to infer the element type of `" +
-                            op.ExecOperand(0) +
-                            ". Please explicitly annotate.");
+        Error1(acc->LOC(), "Failed to infer the element type of `" + acc_sym +
+                               ". Please explicitly annotate.");
       else {
-        auto shape = mc_ty->GetShape();
-        auto storage = mc_ty->GetStorage();
-        mc_ty = MakeSpannedType(candidate_tys.front(), shape, storage);
+        auto shape = res_sty->GetShape();
+        auto storage = res_sty->GetStorage();
+        res_sty = MakeDenseSpannedType(candidate_tys.front(), shape, storage);
       }
     }
-
-    ModifySymbolType(n.LOC(), op.ExecOperand(0), mc_ty);
-    SetNodeType(n, mc_ty);
-    auto mcs_ty = mc_ty->GetMDSpanType()->Clone();
-    ModifySymbolType(n.LOC(), op.ExecOperand(0) + ".span", mcs_ty);
+    if (auto acc_aty = dyn_cast<ArrayType>(acc_ty)) {
+      ModifySymbolType(acc->LOC(), acc_sym,
+                       MakeDenseSpannedArrayType(res_sty->ElementType(),
+                                                 res_sty->GetShape(),
+                                                 acc_aty->Dimensions()));
+    } else
+      ModifySymbolType(acc->LOC(), acc_sym, res_sty);
+    SetNodeType(n, res_sty);
+    auto mdspan_ty = res_sty->GetMDSpanType()->Clone();
+    ModifySymbolType(acc->LOC(), acc_sym + ".span", mdspan_ty);
     if (CCtx().ShowInferredTypes()) {
-      dbgs() << "Symbol:    " << InScopeName(op.ExecOperand(0))
-             << ", Type: " << AST::TYPE_STR(n) << "\n";
+      dbgs() << "Symbol:    " << InScopeName(acc_sym)
+             << ", Type: " << PSTR(GetSymbolType(acc->LOC(), acc_sym)) << "\n";
     }
   } break;
-  case AST::MMAOperation::Store: {
-  } break;
+  case AST::MMAOperation::Store:
+  case AST::MMAOperation::Commit:
+    // no type inference is necessary
+    break;
   default: break;
   }
   return true;
@@ -1026,15 +1069,13 @@ bool TypeInference::Visit(AST::ChunkAt& n) {
   dma_mem = sto;
 
   // update all the positions with correct types
-  for (auto tsi : n.AllOperations()) {
-    for (auto& v : tsi->GetIndices()) { SetNodeType(*v, NodeType(*v)); }
-    if (auto s = tsi->GetStrides())
-      for (auto& v : s->AllValues()) SetNodeType(*v, NodeType(*v));
-  }
+  for (auto op : n.AllOperations())
+    for (auto& v : op->ReferredNodes()) SetNodeType(*v, NodeType(*v));
 
   // also update current node
-  SetNodeType(n, MakeSpannedType(
-                     fmty, cast<SpannedType>(n.GetType())->GetShape(), sto));
+  auto nty = cast<SpannedType>(n.GetType());
+  SetNodeType(n,
+              MakeSpannedType(fmty, nty->GetShape(), nty->GetStrides(), sto));
 
   return true;
 }
@@ -1094,7 +1135,8 @@ bool TypeInference::Visit(AST::Select& n) {
   assert(sty);
   dma_mem = sty->GetStorage();
   dma_fmty = sty->ElementType();
-  SetNodeType(n, MakeSpannedType(dma_fmty, sty->GetShape(), dma_mem));
+  SetNodeType(n, MakeSpannedType(dma_fmty, sty->GetShape(), sty->GetStrides(),
+                                 dma_mem));
   cur_type = n.GetType();
 
   return true;
@@ -1147,14 +1189,14 @@ bool TypeInference::Visit(AST::Return& n) {
         }
       } else {
         // supplement information, note global should be mapped back
-        auto nty = MakeSpannedType(tty->ElementType(), tty->GetShape());
+        auto nty = MakeDenseSpannedType(tty->ElementType(), tty->GetShape());
         ModifySymbolType(n.LOC(), fname, MakeFunctionType(nty, fty->in_tys));
       }
     } else if (isa<UnknownType>(fty->out_ty)) {
       // the type must be inferred
       if (auto tty = dyn_cast<SpannedType>(vty)) {
         // global should be mapped back
-        auto nty = MakeSpannedType(tty->ElementType(), tty->GetShape());
+        auto nty = MakeDenseSpannedType(tty->ElementType(), tty->GetShape());
         ModifySymbolType(n.LOC(), fname, MakeFunctionType(nty, fty->in_tys));
       } else
         ModifySymbolType(n.LOC(), fname, MakeFunctionType(vty, fty->in_tys));

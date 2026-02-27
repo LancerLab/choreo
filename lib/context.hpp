@@ -98,10 +98,8 @@ inline bool FBIContainsBuffer(const FutureBufferInfo& buffer_info,
 
 struct OptimizedValues {
 private:
-  std::vector<ValueItem> val_exprs;
-  // TODO: distinguish values and mdspans
-  // std::vector<ValueItem> mds_exprs;
-  std::vector<ValueItem> ub_exprs;
+  ValueList val_exprs;
+  ValueList ub_exprs;
   ValueItem size_expr = GetInvalidValueItem();
 
 public:
@@ -109,7 +107,7 @@ public:
     val_exprs.clear();
     val_exprs.push_back(vi);
   }
-  void SetVals(const std::vector<ValueItem>& vis) {
+  void SetVals(const ValueList& vis) {
     val_exprs.clear();
     for (auto vi : vis) {
       if (!IsValidValueItem(vi))
@@ -128,7 +126,7 @@ public:
     ub_exprs.clear();
     ub_exprs.push_back(vi);
   }
-  void SetUBounds(const std::vector<ValueItem>& vis) {
+  void SetUBounds(const ValueList& vis) {
     ub_exprs.clear();
     for (auto vi : vis) {
       if (IsValidValueItem(vi))
@@ -201,8 +199,9 @@ private:
   std::map<std::string, std::string> MMA_policy_of_frag;
 
   struct DynMemReuseInfo {
-    std::string simulator;
     struct InfoEntry {
+      // the name of simulator var
+      std::string simulator;
       // the name of chunks vector
       std::string chunks_name;
       // the live ranges of each chunk
@@ -351,6 +350,7 @@ private:
   bool drop_comment = false;        // drop any comments
   bool debug_all = false;           // enable full debug
   bool show_inferred_types = false; // show the inferred types
+  bool show_strides = false;        // show the strides
   bool dump_symtab = false;         // dump symbol table after type check
   bool visualize = false;           // visualize the DMAs
   bool cross_compile = false;       // TODO: figure out
@@ -372,8 +372,10 @@ private:
   bool inhibit_warning = false;    // Inhibit all warning messages.
   bool warning_as_error = false;   // Make all warnings into errors.
   bool disable_runtime_check = false; // Disable all runtime checks.
-  std::string debug_file_dir;         // directory for compiler debug artifacts
-  std::string api_mode = "cffi";      // API mode for generated code
+  bool disable_cuda_runtime_env_check =
+      false;                     // Do not emit cuda runtime env check.
+  std::string debug_file_dir;    // directory for compiler debug artifacts
+  std::string api_mode = "cffi"; // API mode for generated code
 
 private:
   std::shared_ptr<SymbolTable> sym_tab = nullptr; // global symbol table
@@ -483,6 +485,7 @@ public:
   bool DropComments() const { return drop_comment; }
   bool DebugAll() const { return debug_all; }
   bool ShowInferredTypes() const { return show_inferred_types; }
+  bool ShowStrides() const { return show_strides; }
   bool DumpSymtab() const { return dump_symtab; }
   bool Visualize() const { return visualize; }
   bool CrossCompile() const { return cross_compile; }
@@ -502,6 +505,9 @@ public:
   bool InhibitWarning() const { return inhibit_warning; }
   bool WarningAsError() const { return warning_as_error; }
   bool DisableRuntimeCheck() const { return disable_runtime_check; }
+  bool DisableCudaRuntimeEnvCheck() const {
+    return disable_cuda_runtime_env_check;
+  }
   const std::string& GetDebugFileDir() const { return debug_file_dir; }
   void SetDebugFileDir(const std::string& dir) { debug_file_dir = dir; }
   const std::string& GetApiMode() const { return api_mode; }
@@ -515,6 +521,7 @@ public:
   void SetDropComments(bool value) { drop_comment = value; }
   void SetDebugAll(bool value) { debug_all = value; }
   void SetShowInferredTypes(bool value) { show_inferred_types = value; }
+  void SetShowStrides(bool value) { show_strides = value; }
   void SetDumpSymtab(bool value) { dump_symtab = value; }
   void SetVisualize(bool value) { visualize = value; }
   void SetCrossCompile(bool value) { cross_compile = value; }
@@ -536,6 +543,9 @@ public:
   void SetInhibitWarning(bool value) { inhibit_warning = value; }
   void SetWarningAsError(bool value) { warning_as_error = value; }
   void SetDisableRuntimeCheck(bool value) { disable_runtime_check = value; }
+  void SetDisableCudaRuntimeEnvCheck(bool value) {
+    disable_cuda_runtime_env_check = value;
+  }
 
   const std::unordered_map<std::string, std::string>& GetCLMacros() const {
     return cl_macros;
@@ -605,6 +615,9 @@ public:
   }
   auto TargetParallelLevels() const {
     return GetTarget().GetParallelLevels(GetArch());
+  }
+  auto TargetSwizzleModes() const {
+    return GetTarget().SupportedSwizzleModes(GetArch());
   }
 
 public:

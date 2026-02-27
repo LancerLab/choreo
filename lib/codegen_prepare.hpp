@@ -53,7 +53,9 @@ private:
   std::set<std::string> select_syms;
 
   AST::ParallelBy* block_pb = nullptr;
+  ParallelLevel inner_pb_level = ParallelLevel::BLOCK;
   std::vector<AST::ParallelBy*> pb_stack;
+  AST::InThreadsBlock* in_thr_block = nullptr;
 
 private:
   auto Level() const {
@@ -73,6 +75,10 @@ private:
         auto& tma_descs = cgi.GetTMADescs();
         tma_descs.emplace(pb, std::vector<TMADesc>{});
       } else {
+        if (pb_level == ParallelLevel::GROUP ||
+            pb_level == ParallelLevel::GROUPx4) {
+          if (pb->IsEnforced()) inner_pb_level = pb_level;
+        }
         assert(!pb_stack.empty());
       }
       pb_stack.push_back(pb);
@@ -98,6 +104,18 @@ private:
         choreo_unreachable("The explicit parallel-by level " +
                            STR(pb->GetLevel()) + " is not supported.");
       }
+    } else if (auto it = dyn_cast<AST::InThreadsBlock>(&n)) {
+      if (inner_pb_level == ParallelLevel::GROUPx4 ||
+          inner_pb_level == ParallelLevel::GROUP)
+        in_thr_block = it;
+      // todo: predicate of inthreads_block should be analyzed to make sure it
+      // is compatible with the inner parallel-by level. For example, if the
+      // inner parallel-by is group, the predicate should be "p1 == 0" to make
+      // sure only one warp participates in the TMA copy. if the inner
+      // parallel-by is group4, the predicate should be "p1 == 0 || p1 == 2"
+      //  to make sure two warpgroup participate in the TMA copy.
+      // There may exist complex expressions for the predicate, such as "p1 % 2
+      // && p1 < 4".
     }
     return true;
   }
@@ -180,6 +198,8 @@ private:
                          << "\n");
         block_pb = nullptr;
       }
+    } else if (isa<AST::InThreadsBlock>(&n)) {
+      in_thr_block = nullptr;
     }
     return true;
   }
@@ -250,9 +270,12 @@ public:
            (tsty->GetStorage() == Storage::GLOBAL ||
             tsty->GetStorage() == Storage::DEFAULT))) {
         auto& tma_descs = cgi.GetTMADescs();
-        tma_descs[block_pb].emplace_back(
-            n.GetFrom(), n.GetTo(), InScopeName(n.GetFrom()->RefSymbol()),
-            InScopeName(n.GetTo()->RefSymbol()), n.GetSwizzleValue());
+        auto tma_desc = TMADesc(n.GetSrc(), n.GetDst(),
+                                InScopeName(n.GetSrc()->RefSymbol()),
+                                InScopeName(n.GetDst()->RefSymbol()),
+                                n.GetSwizzleMode(), inner_pb_level);
+        tma_desc.SetInThreadsBlock(in_thr_block);
+        tma_descs.at(block_pb).push_back(tma_desc);
       } else
         choreo_unreachable(
             "unsupport TMA direction: " + STR(fsty->GetStorage()) + " => " +
@@ -269,9 +292,9 @@ public:
     case AST::MMAOperation::Fill: break;
     case AST::MMAOperation::Load: break;
     case AST::MMAOperation::Exec: {
-      auto& a_sym = op.ExecOperand(1);
-      auto& b_sym = op.ExecOperand(2);
-      auto& c_sym = op.ExecOperand(0);
+      auto& a_sym = AST::FragName(op.ExecOperand(1));
+      auto& b_sym = AST::FragName(op.ExecOperand(2));
+      auto& c_sym = AST::FragName(op.ExecOperand(0));
       auto a_ty = GetSpannedType(GetSymbolType(a_sym));
       auto b_ty = GetSpannedType(GetSymbolType(b_sym));
       auto c_ty = GetSpannedType(GetSymbolType(c_sym));
@@ -282,9 +305,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(0));
         mma_shape.push_back(b_shape.ValueAt(0));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(1), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(1) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(1));
         break;
@@ -292,9 +313,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(0));
         mma_shape.push_back(b_shape.ValueAt(1));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(1), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(1) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(1));
         break;
@@ -302,9 +321,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(1));
         mma_shape.push_back(b_shape.ValueAt(0));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(0), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(0) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(0));
         break;
@@ -312,9 +329,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(1));
         mma_shape.push_back(b_shape.ValueAt(1));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(0), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(0) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(0));
         break;
@@ -335,8 +350,8 @@ public:
           InScopeName(c_sym),
           MMAInfo{acc_ty, mma_shape, MMAInfo::FRAG_C, op.GetMethod()});
 
-      if (op.IsSparse() && !op.ExecOperand(3).empty()) {
-        auto e_sym = op.ExecOperand(3);
+      if (op.IsSparse() && op.ExecOperand(3)) {
+        auto e_sym = AST::FragName(op.ExecOperand(3));
         auto e_ty = GetSpannedType(GetSymbolType(e_sym));
         cgi.AddSymbolMMA(InScopeName(e_sym),
                          MMAInfo{e_ty->ElementType(), mma_shape,
@@ -346,10 +361,11 @@ public:
       VST_DEBUG(dbgs() << "mma type: " << STR(a_ety) << ", " << STR(b_ety)
                        << ", " << STR(acc_ty) << ", shape: " << STR(mma_shape)
                        << " -> " << a_sym << ", " << b_sym << ", " << c_sym
-                       << (op.IsSparse() ? ", " + op.ExecOperand(3) : "")
+                       << (op.IsSparse() ? ", " + PSTR(op.ExecOperand(3)) : "")
                        << "\n");
     } break;
     case AST::MMAOperation::Store: break;
+    case AST::MMAOperation::Commit: break;
     default: choreo_unreachable("unsupported mma operation.");
     }
     return true;

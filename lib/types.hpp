@@ -121,6 +121,11 @@ inline static bool ApprxEqual(BaseType lty, BaseType rty) {
   return lty == rty;
 }
 
+inline static bool ApprxEqualRank(BaseType lty, BaseType rty) {
+  if (lty == BaseType::UNKNOWN || rty == BaseType::UNKNOWN) return true;
+  return lty == rty;
+}
+
 inline static bool IsIntegerType(BaseType bt) {
   return bt == BaseType::S64 || bt == BaseType::U64 || bt == BaseType::S32 ||
          bt == BaseType::U32 || bt == BaseType::S16 || bt == BaseType::U16 ||
@@ -652,16 +657,21 @@ struct Shape {
 
   void Update() { dim_count = values[val_no].size(); }
 
+  bool IsRankDummy() const { return IsUnknownRank(dim_count); }
+
   bool IsRanked() const {
     // ok to hold a valid rank only
+    if (IsRankDummy()) return false;
     if (!IsValidValueNumber(val_no)) return IsValidRank(dim_count);
     return dim_count == values[val_no].size();
   }
 
+  // has valid and consistent value
   bool IsValid() const {
     if (!IsValidValueNumber(val_no)) return false;
     return dim_count == values[val_no].size();
   }
+  bool IsValidOrDummy() const { return IsValid() || IsRankDummy(); }
 
   const ValueList& Value() const {
     if (!IsValid()) choreo_unreachable("the shape is not accessible.");
@@ -671,6 +681,23 @@ struct Shape {
   const ValueItem LeadingValue() const {
     if (!IsValid()) choreo_unreachable("the shape is not accessible.");
     return values[val_no].back();
+  }
+
+  const ValueList GenDenseStrides() const {
+    if (!IsValid()) choreo_unreachable("the shape is not accessible.");
+    ValueList dense_strides;
+
+    auto stride = sbe::nu(1);
+    dense_strides.push_back(stride); // leading-dimension is always 1
+    if (Rank() > 1) {
+      for (auto v = values[val_no].rbegin(); v != values[val_no].rend() - 1;
+           ++v) {
+        stride = (stride * (*v))->Normalize();
+        dense_strides.push_back(stride);
+      }
+    }
+    std::reverse(dense_strides.begin(), dense_strides.end());
+    return dense_strides;
   }
 
   const Shape TrimDims(size_t n) const {
@@ -692,6 +719,9 @@ struct Shape {
 
   bool SameRankAs(const Shape& s) const {
     return IsRanked() && s.IsRanked() && (Rank() == s.Rank());
+  }
+  bool CompatibleRank(const Shape& s) const {
+    return SameRankAs(s) || s.IsRankDummy() || IsRankDummy();
   }
 
   const ValueItem& ValueAt(size_t index) const {
@@ -815,6 +845,8 @@ inline MultiBounds operator-(const MultiBounds& lhs, const MultiBounds& rhs) {
 
   return {vl.size(), vl};
 }
+
+ValueList GenUninitValueList(size_t rank);
 
 struct Type {
   BaseType bt = BaseType::UNKNOWN;
@@ -1637,23 +1669,24 @@ struct MDSpanType : public Type, public TypeIDProvider<MDSpanType> {
   bool HasSufficientInfo() const override { return value.IsValid(); }
 
   bool operator==(const Type& ty) const override {
-    if (!isa<MDSpanType>(&ty)) return false;
-    auto& mty = ((const MDSpanType&)ty);
-    // Must consider the condition whn shapes are not accurately decided
-    // (only the dim-count is available)
-    return (mty.value == value) || (!mty.value.IsValid() && !value.IsValid() &&
-                                    mty.value.SameRankAs(value));
+    if (&ty == this) return true;
+    if (auto mty = dyn_cast<MDSpanType>(&ty)) {
+      // Must consider the condition whn shapes are not accurately decided
+      // (only the dim-count is available)
+      if (mty->value.IsValid() && value.IsValid()) return mty->value == value;
+      return mty->value.SameRankAs(value);
+    }
+    return false;
   }
 
   bool ApprxEqual(const Type& ty) const override {
+    if (&ty == this) return true;
     if (auto pty = dyn_cast<PlaceHolderType>(&ty))
       return pty->ApprxEqual(*this);
 
-    if (auto sty = dyn_cast<MDSpanType>(&ty)) {
-      if (!value.IsRanked() || !sty->value.IsRanked())
-        return true; // it is ok when the shape is unknown
-      else
-        return ty.Dims() == Dims();
+    if (auto mty = dyn_cast<MDSpanType>(&ty)) {
+      if (mty->value.IsValid() && value.IsValid()) return mty->value == value;
+      return mty->value.CompatibleRank(value);
     }
     return false;
   }
@@ -1665,14 +1698,60 @@ struct MDSpanType : public Type, public TypeIDProvider<MDSpanType> {
   void Print(std::ostream& os) const override {
     os << "mdspan<";
     if (value.IsRanked()) os << Dims();
-    os << ">";
-    if (value.IsRanked()) os << " " << STR(value);
+    os << "> " << STR(value);
   }
 
   const std::string Name() const override { return "mdspan"; }
 
   __UDT_TYPE_INFO__(Type, MDSpanType)
 };
+
+enum class Modality { MUST, MAY, NOT /*MUST_NOT*/ };
+inline Modality operator&(const Modality l, const Modality r) {
+  if (l == Modality::NOT) return l;
+  if (l == Modality::MAY) {
+    if (l == Modality::MUST)
+      return l;
+    else
+      return r;
+  }
+  return r;
+}
+inline Modality operator|(const Modality l, const Modality r) {
+  if (l == Modality::MUST) return l;
+  if (l == Modality::MAY) {
+    if (l == Modality::NOT)
+      return l;
+    else
+      return r;
+  }
+  return r;
+}
+
+inline Modality operator&=(Modality& l, const Modality r) {
+  l = l & r;
+  return l;
+}
+inline Modality operator|=(Modality& l, const Modality r) {
+  l = l | r;
+  return l;
+}
+// providing the shape and stride, judge if it is contiguous
+inline Modality IsContiguous(const Shape& shape, const ValueList& strides) {
+  if (!shape.IsValid()) choreo_unreachable("the shape is not accessible.");
+  if (shape.DimCount() != strides.size())
+    choreo_unreachable("shape and stride does not match.");
+  if (!sbe::ceq(strides.back(), sbe::nu(1))) return Modality::NOT;
+
+  auto strd = sbe::nu(1);
+  Modality p = Modality::MUST;
+  for (int i = shape.DimCount() - 2; i >= 0; --i) {
+    strd *= shape.Value()[i + 1];
+    if (sbe::must_ne(strd, strides[i])) p &= Modality::NOT;
+    if (sbe::may_ne(strd, strides[i])) p &= Modality::MAY;
+  }
+  return p;
+}
 
 struct SpannedType;
 template <>
@@ -1684,11 +1763,13 @@ struct SpannedType : public Type, public TypeIDProvider<SpannedType> {
   using FundamentalType = BaseType;
   FundamentalType e_type;
   ptr<MDSpanType> s_type = nullptr;
+  ValueList strides;
   Storage m_type;
 
-  SpannedType(BaseType t, const ptr<MDSpanType>& s,
+  SpannedType(BaseType t, const ptr<MDSpanType>& s, const ValueList& strd,
               Storage m = Storage::DEFAULT)
-      : Type(BaseType::SPANNED), e_type(t), s_type(s), m_type(m) {
+      : Type(BaseType::SPANNED), e_type(t), s_type(s), strides(strd),
+        m_type(m) {
     assert((s_type != nullptr) && "mdspan is not initialized.");
     assert(IsScalarType(e_type) && "element type must be a scalar type.");
   }
@@ -1696,7 +1777,7 @@ struct SpannedType : public Type, public TypeIDProvider<SpannedType> {
   const ptr<Type> CloneImpl() const override {
     assert(s_type);
     return std::make_shared<SpannedType>(
-        e_type, cast<MDSpanType>(s_type->Clone()), m_type);
+        e_type, cast<MDSpanType>(s_type->Clone()), strides, m_type);
   }
 
   BaseType ElementType() const { return e_type; }
@@ -1707,21 +1788,28 @@ struct SpannedType : public Type, public TypeIDProvider<SpannedType> {
     return s_type->HasSufficientInfo();
   }
 
+  void SetStrides(const ValueList& strd) { strides = strd; }
+  const ValueList& GetStrides() const { return strides; }
+  Modality IsDense() const { return IsContiguous(GetShape(), GetStrides()); }
+
   bool operator==(const Type& ty) const override {
+    if (&ty == this) return true;
     if (!isa<SpannedType>(&ty)) return false;
     auto& t = (SpannedType&)ty;
-    return t.e_type == e_type && *t.s_type == *s_type &&
+    return t.e_type == e_type && *t.s_type == *s_type && t.strides == strides &&
            Compatible(t.m_type, m_type);
   }
 
   // Ignore the memory
   bool LogicalEqual(const Type& ty) const override {
+    if (&ty == this) return true;
     if (!isa<SpannedType>(&ty)) return false;
     auto& t = (SpannedType&)ty;
     return t.e_type == e_type && *t.s_type == *s_type;
   }
 
   bool ApprxEqual(const Type& ty) const override {
+    if (&ty == this) return true;
     if (auto pty = dyn_cast<PlaceHolderType>(&ty))
       return pty->ApprxEqual(*this);
 
@@ -1732,7 +1820,7 @@ struct SpannedType : public Type, public TypeIDProvider<SpannedType> {
            t.s_type->ApprxEqual(*s_type);
   }
 
-  Shape GetShape() const { return s_type->GetShape(); }
+  const Shape GetShape() const { return s_type->GetShape(); }
   const ptr<MDSpanType> GetMDSpanType() const { return s_type; }
 
   bool RuntimeShaped() const {
@@ -1760,12 +1848,7 @@ struct SpannedType : public Type, public TypeIDProvider<SpannedType> {
   void SetStorage(Storage s) { m_type = s; }
   Storage GetStorage() const { return m_type; }
 
-  void Print(std::ostream& os) const override {
-    if (m_type != Storage::NONE && m_type != Storage::DEFAULT)
-      os << STR(m_type) << " ";
-    os << STR(e_type) << " ";
-    s_type->Print(os);
-  }
+  void Print(std::ostream& os) const override;
 
   const std::string Name() const override { return "spanned"; }
 
@@ -1859,8 +1942,8 @@ struct BoundedType : public Type, public TypeIDProvider<BoundedType> {
   virtual bool HasValidBound() const = 0;
   virtual const ValueItem& GetUpperBound() const = 0;
   virtual const MultiBounds GetUpperBounds() const = 0;
-  virtual int GetStride() const = 0;
-  virtual IntegerList GetStrides() const = 0;
+  virtual int GetStep() const = 0;
+  virtual IntegerList GetSteps() const = 0;
   virtual int GetWidth() const = 0;
   virtual IntegerList GetWidths() const = 0;
 
@@ -1878,7 +1961,7 @@ struct BoundedIntegerType final : public BoundedType,
                                   public TypeIDProvider<BoundedIntegerType> {
   ValueItem lbound = GetInvalidValueItem();
   ValueItem ubound = GetInvalidValueItem();
-  int stride = GetInvalidStride();
+  int step = GetInvalidStep();
   int width = 1;
 
   BoundedIntegerType() : BoundedType(BaseType::BOUNDED_INT, "") {}
@@ -1887,32 +1970,32 @@ struct BoundedIntegerType final : public BoundedType,
   BoundedIntegerType(const ValueItem& lexpr, const ValueItem& uexpr, int s = 1,
                      const std::string& note = "")
       : BoundedType(BaseType::BOUNDED_INT, note), lbound(lexpr), ubound(uexpr),
-        stride(s) {}
+        step(s) {}
 
   const ptr<Type> CloneImpl() const override {
-    return std::make_shared<BoundedIntegerType>(lbound, ubound, stride);
+    return std::make_shared<BoundedIntegerType>(lbound, ubound, step);
   }
   size_t Dims() const override { return 1; }
   bool IsComplete() const override { return true; }
   bool HasSufficientInfo() const override { return HasValidBound(); }
   bool HasValidBound() const override {
     return IsValidValueItem(lbound) && IsValidValueItem(ubound) &&
-           IsValidStride(stride);
+           IsValidStep(step);
   }
   ValueItem GetLowerBound() const { return lbound; }
   const ValueItem& GetUpperBound() const override { return ubound; }
   const MultiBounds GetUpperBounds() const override {
     return MultiBounds(1, ubound);
   }
-  int GetStride() const override { return stride; }
-  IntegerList GetStrides() const override { return IntegerList(1, stride); }
+  int GetStep() const override { return step; }
+  IntegerList GetSteps() const override { return IntegerList(1, step); }
   int GetWidth() const override { return width; }
   IntegerList GetWidths() const override { return IntegerList(1, width); }
   bool operator==(const Type& ty) const override {
     if (!isa<BoundedIntegerType>(&ty)) return false;
     auto bty = (BoundedIntegerType&)ty;
     return (bty.lbound == lbound) && (bty.ubound == ubound) &&
-           (bty.stride == stride);
+           (bty.step == step);
   }
 
   bool ApprxEqual(const Type& ty) const override {
@@ -1926,7 +2009,7 @@ struct BoundedIntegerType final : public BoundedType,
       os << "int->[unknown]";
     else
       os << "int->[" << STR(lbound) << "," << STR(ubound) << "]";
-    if (plain == false) os << ":" << stride;
+    if (plain == false) os << ":" << step;
     BoundedType::Print(os);
   }
 
@@ -1939,20 +2022,20 @@ struct BoundedITupleType final : public BoundedType,
                                  public TypeIDProvider<BoundedITupleType> {
   MultiBounds lbounds;
   MultiBounds ubounds;
-  IntegerList strides;
+  IntegerList steps;
   IntegerList widths;
 
   BoundedITupleType(const MultiBounds& l, const MultiBounds& u,
                     const IntegerList s, const std::string& k = "",
                     const std::string& v = "")
       : BoundedType(BaseType::BOUNDED_ITUPLE, k, v), lbounds(l), ubounds(u),
-        strides(s) {
+        steps(s) {
     if (lbounds.IsValid())
       assert((lbounds.DimCount() == ubounds.DimCount()) &&
-             (lbounds.DimCount() == strides.size()) &&
+             (lbounds.DimCount() == steps.size()) &&
              "expecting a valid bound.");
     else
-      assert(!ubounds.IsValid() && strides.empty() &&
+      assert(!ubounds.IsValid() && steps.empty() &&
              "expecting an invalid bound.");
     widths = IntegerList(lbounds.DimCount(), 1);
   }
@@ -1961,18 +2044,18 @@ struct BoundedITupleType final : public BoundedType,
                     const IntegerList s, const IntegerList w,
                     const std::string& k = "", const std::string& v = "")
       : BoundedType(BaseType::BOUNDED_ITUPLE, k, v), lbounds(l), ubounds(u),
-        strides(s), widths(w) {
+        steps(s), widths(w) {
     if (lbounds.IsValid())
       assert((lbounds.DimCount() == ubounds.DimCount()) &&
-             (lbounds.DimCount() == strides.size()) &&
+             (lbounds.DimCount() == steps.size()) &&
              "expecting a valid bound.");
     else
-      assert(!ubounds.IsValid() && strides.empty() &&
+      assert(!ubounds.IsValid() && steps.empty() &&
              "expecting an invalid bound.");
   }
 
   const ptr<Type> CloneImpl() const override {
-    return std::make_shared<BoundedITupleType>(lbounds, ubounds, strides);
+    return std::make_shared<BoundedITupleType>(lbounds, ubounds, steps);
   }
   size_t Dims() const override { return ubounds.Rank(); }
   bool IsComplete() const override { return true; }
@@ -1980,8 +2063,8 @@ struct BoundedITupleType final : public BoundedType,
   const MultiBounds GetLowerBounds() const { return lbounds; }
   const MultiBounds GetUpperBounds() const override { return ubounds; }
   const Shape GetSizes() const { return ubounds - lbounds; }
-  int GetStride() const override { return strides[0]; }
-  IntegerList GetStrides() const override { return strides; }
+  int GetStep() const override { return steps[0]; }
+  IntegerList GetSteps() const override { return steps; }
   int GetWidth() const override { return widths[0]; }
   IntegerList GetWidths() const override { return widths; }
   const ValueItem& GetUpperBound() const override { return ubounds.ValueAt(0); }
@@ -1991,23 +2074,23 @@ struct BoundedITupleType final : public BoundedType,
   const ValueItem& GetLowerBound(size_t idx = 0) const {
     return lbounds.ValueAt(idx);
   }
-  int GetStride(size_t idx) const { return strides[idx]; }
+  int GetStep(size_t idx) const { return steps[idx]; }
   int GetWidth(size_t idx) const { return widths[idx]; }
   bool IsPlain(size_t idx) const {
-    return (*lbounds.ValueAt(idx) == *sbe::nu(0)) && (strides[idx] == 1);
+    return (*lbounds.ValueAt(idx) == *sbe::nu(0)) && (steps[idx] == 1);
   }
   bool HasValidBound() const override {
-    return lbounds.IsValid() && ubounds.IsValid() && !strides.empty() &&
+    return lbounds.IsValid() && ubounds.IsValid() && !steps.empty() &&
            (lbounds.DimCount() == ubounds.DimCount()) &&
-           (lbounds.DimCount() == strides.size()) &&
-           (strides.size() == widths.size());
+           (lbounds.DimCount() == steps.size()) &&
+           (steps.size() == widths.size());
   }
 
   bool operator==(const Type& ty) const override {
     if (!isa<BoundedITupleType>(&ty)) return false;
     auto& t = (BoundedITupleType&)ty;
     return (t.lbounds == lbounds) && (t.ubounds == ubounds) &&
-           (t.strides == strides) && (t.widths == widths);
+           (t.steps == steps) && (t.widths == widths);
   }
 
   bool ApprxEqual(const Type& ty) const override {
@@ -2036,7 +2119,7 @@ struct BoundedITupleType final : public BoundedType,
 
     if (plain) {
       os << STR(ubounds);
-      if (strides[0] != 1) os << ", s = " << strides[0];
+      if (steps[0] != 1) os << ", s = " << steps[0];
       if (widths[0] != 1) os << ", w = " << widths[0];
       BoundedType::Print(os);
       return;
@@ -2047,7 +2130,7 @@ struct BoundedITupleType final : public BoundedType,
 
     for (size_t i = 1; i < Dims(); ++i) {
       os << ", [" << STR(lbounds.ValueAt(i)) << "," << STR(ubounds.ValueAt(i))
-         << "):" << strides[i];
+         << "):" << steps[i];
     }
     os << "}";
 
@@ -2107,7 +2190,8 @@ struct FutureType : public AsyncType, public TypeIDProvider<FutureType> {
   bool IsComplete() const override { return true; }
   bool HasSufficientInfo() const override { return psty->HasSufficientInfo(); }
   const std::string Name() const override { return "future"; }
-  Shape GetShape() { return psty->GetShape(); }
+  const Shape GetShape() { return psty->GetShape(); }
+  const ValueList& GetStrides() { return psty->GetStrides(); }
   const ptr<SpannedType>& GetSpannedType() const { return psty; }
   BaseType ElementType() const { return psty->ElementType(); }
   size_t Dims() const override { return psty->Dims(); }
@@ -2197,75 +2281,75 @@ struct FunctionType : public Type, public TypeIDProvider<FunctionType> {
   __UDT_TYPE_INFO__(Type, FunctionType)
 };
 
-// ArrayType's size is fixed
+// ArrayType's size must be known in compile-time.
 struct ArrayType : public Type, public TypeIDProvider<ArrayType> {
-  std::vector<size_t> dims;
+  ValueList dims;
 
-  ArrayType(std::initializer_list<size_t> ds) : Type(BaseType::ARRAY) {
-    for (auto d : ds) {
-      if (d == 0) choreo_unreachable("invalid dimension.");
-      dims.push_back(d);
-    }
+  ArrayType(ValueList l) : Type(BaseType::ARRAY) { dims = l; }
+  ArrayType(size_t rank) : Type(BaseType::ARRAY) {
+    dims = GenUninitValueList(rank);
   }
 
-  explicit ArrayType(const std::vector<size_t>& ds) : Type(BaseType::ARRAY) {
-    for (auto d : ds) {
-      if (d == 0) choreo_unreachable("invalid dimension.");
-      dims.push_back(d);
-    }
+  const ptr<Type> CloneImpl() const override {
+    return std::make_shared<ArrayType>(Dimensions());
   }
 
-  virtual const ptr<Type> ArrayElementType() const = 0;
-  virtual const ptr<Type> SubScriptType(size_t) = 0;
+  size_t Dims() const override { return ArrayRank(); }
+
+  bool IsComplete() const override { return true; }
+  bool HasSufficientInfo() const override { return true; }
+
+  bool ApprxEqual(const Type& ty) const override { return operator==(ty); }
+
+  const std::string Name() const override { return "array"; }
+
+  virtual const ptr<Type> ArrayElementType() const {
+    return std::make_shared<NoValueType>();
+  }
+  virtual const ptr<Type> SubScriptType(size_t) {
+    return std::make_shared<NoValueType>();
+  };
 
   size_t ArrayRank() const { return dims.size(); }
 
   // array[n][m] - subscripting by 1  results in array[n]
-  virtual const std::vector<size_t> SubScript(size_t dim_count) {
+  virtual ValueList SubScript(size_t dim_count) {
     if (dim_count > dims.size())
       choreo_unreachable("invalid subscription: not enough dimension.");
-    return std::vector<size_t>(dims.begin(), dims.begin() + dim_count);
+    return ValueList(dims.begin(), dims.begin() + dim_count);
   }
 
   // array[n][m] - subscripting by 1  the remainder dimensions is [m]
-  virtual const std::vector<size_t> RemainderDimensions(size_t dim_count) {
+  virtual const ValueList RemainderDimensions(size_t dim_count) {
     if (dim_count > dims.size())
       choreo_unreachable("invalid subscription: not enough dimension.");
-    return std::vector<size_t>(dims.begin() + dim_count, dims.end());
+    return ValueList(dims.begin() + dim_count, dims.end());
   }
 
-  virtual size_t Dimension(size_t idx) const { return dims.at(idx); }
-  virtual const std::vector<size_t>& Dimensions() const { return dims; }
-  virtual size_t ElemCount() const {
+  virtual ValueItem Dimension(size_t idx) const { return dims.at(idx); }
+  virtual const ValueList& Dimensions() const { return dims; }
+  virtual ValueItem ElemCount() const {
     if (dims.size() == 0) {
       choreo_unreachable("invalid array.");
       return 0;
     }
-
-    size_t ec = 1;
-    for (auto d : dims) ec *= d;
-
-    return ec;
+    return MultiplyAll(dims);
   }
 
-  virtual bool operator==(const Type& ty) const {
-    if (auto t = dyn_cast<ArrayType>(&ty)) {
-      if (ArrayRank() != t->ArrayRank()) return false;
-      for (size_t idx = 0; idx < ArrayRank(); ++idx)
-        if (Dimension(idx) != t->Dimension(idx)) return false;
-      return true;
-    }
+  virtual bool operator==(const Type& ty) const override {
+    if (auto t = dyn_cast<ArrayType>(&ty))
+      return IsValueListEqual(Dimensions(), t->Dimensions());
     return false;
   }
 
-  virtual void Print(std::ostream& os) const {
+  virtual void Print(std::ostream& os) const override {
     os << "[";
-    for (auto d : dims) os << "[" << d << "]";
+    for (const auto& d : dims) os << "[" << STR(d) << "]";
     os << "]";
   }
 
   virtual void PrintAsCArray(std::ostream& os) const {
-    for (auto d : dims) os << "[" << d << "]";
+    for (const auto& d : dims) os << "[" << STR(d) << "]";
   }
 
   // for runtime type disambiguation
@@ -2275,10 +2359,10 @@ struct ArrayType : public Type, public TypeIDProvider<ArrayType> {
 struct EventArrayType final : public ArrayType,
                               public TypeIDProvider<EventArrayType> {
   ptr<EventType> event;
-  EventArrayType(Storage s, std::initializer_list<size_t> ec)
+  explicit EventArrayType(Storage s, const ValueList& ec)
       : ArrayType(ec), event(std::make_shared<EventType>(s)) {}
-  explicit EventArrayType(Storage s, const std::vector<size_t>& ec)
-      : ArrayType(ec), event(std::make_shared<EventType>(s)) {}
+  explicit EventArrayType(Storage s, size_t rank)
+      : ArrayType(rank), event(std::make_shared<EventType>(s)) {}
 
   const ptr<Type> CloneImpl() const override {
     return std::make_shared<EventArrayType>(event->GetStorage(),
@@ -2304,7 +2388,7 @@ struct EventArrayType final : public ArrayType,
 
   bool operator==(const Type& ty) const override {
     if (auto t = dyn_cast<EventArrayType>(&ty))
-      return t->ElemCount() == ElemCount();
+      return sbe::must_eq(t->ElemCount(), ElemCount());
     return false;
   }
 
@@ -2325,14 +2409,20 @@ struct EventArrayType final : public ArrayType,
 struct SpannedArrayType final : public ArrayType,
                                 public TypeIDProvider<SpannedArrayType> {
   ptr<SpannedType> spty = nullptr;
-  explicit SpannedArrayType(BaseType ft, const ptr<MDSpanType>& s, Storage m,
-                            const std::vector<size_t>& ads)
-      : ArrayType(ads), spty(std::make_shared<SpannedType>(ft, s, m)) {}
+  explicit SpannedArrayType(BaseType ft, const ptr<MDSpanType>& s,
+                            const ValueList& strd, Storage m,
+                            const ValueList& ads)
+      : ArrayType(ads), spty(std::make_shared<SpannedType>(ft, s, strd, m)) {}
+
+  explicit SpannedArrayType(BaseType ft, const ptr<MDSpanType>& s,
+                            const ValueList& strd, Storage m, size_t array_rank)
+      : ArrayType(array_rank),
+        spty(std::make_shared<SpannedType>(ft, s, strd, m)) {}
 
   const ptr<Type> CloneImpl() const override {
     return std::make_shared<SpannedArrayType>(
         spty->ElementType(), cast<MDSpanType>(spty->s_type->Clone()),
-        spty->GetStorage(), ArrayType::Dimensions());
+        spty->GetStrides(), spty->GetStorage(), ArrayType::Dimensions());
   }
 
   const ptr<Type> ArrayElementType() const override {
@@ -2346,17 +2436,19 @@ struct SpannedArrayType final : public ArrayType,
     auto arr = SubScript(subscription_count);
     if (arr.size() == 0)
       return std::make_shared<SpannedType>(spty->e_type, spty->GetMDSpanType(),
+                                           spty->GetStrides(),
                                            spty->GetStorage());
     else
       return std::make_shared<SpannedArrayType>(
-          spty->e_type, spty->GetMDSpanType(), spty->GetStorage(), arr);
+          spty->e_type, spty->GetMDSpanType(), spty->GetStrides(),
+          spty->GetStorage(), arr);
   }
 
   size_t Dims() const override { return ArrayType::ArrayRank(); }
 
   bool operator==(const Type& ty) const override {
     if (auto t = dyn_cast<SpannedArrayType>(&ty))
-      return t->ElemCount() == ElemCount();
+      return sbe::must_eq(t->ElemCount(), ElemCount());
     return false;
   }
 
@@ -2565,6 +2657,10 @@ inline bool CanYieldIndex(const ptr<Type>& ty) {
          (isa<ITupleType>(ty));
 }
 
+inline bool IntegersOnly(const ptr<Type>& ty) {
+  return isa<ScalarIntegerType>(ty) || (isa<ITupleType>(ty));
+}
+
 inline bool ConvertibleToInt(const ptr<Type>& ty) {
   return ConvertibleToInt(*ty);
 }
@@ -2581,11 +2677,11 @@ inline ValueItem GetSingleUpperBound(const ptr<Type>& ty) {
   return cast<BoundedType>(ty)->GetUpperBound();
 }
 
-inline int GetSingleStride(const ptr<Type>& ty) {
+inline int GetSingleStep(const ptr<Type>& ty) {
   if (!IsActualBoundedIntegerType(ty))
     choreo_unreachable("can not get the single stride for a " + PSTR(ty) +
                        " type.");
-  return cast<BoundedType>(ty)->GetStride();
+  return cast<BoundedType>(ty)->GetStep();
 }
 
 inline int GetSingleWidth(const ptr<Type>& ty) {
@@ -2597,7 +2693,13 @@ inline int GetSingleWidth(const ptr<Type>& ty) {
 
 // utility functions to generate types
 // Note: should always use utility functions
-inline Shape GenUninitShape() { return Shape(); }
+inline Shape GenInvalidShape() { return Shape(); }
+inline Shape GenUnknownShape() { return Shape(GetUnknownRank()); }
+
+// To indicate uninferred array dims.
+inline ValueList GenUninitValueList(size_t rank) {
+  return ValxN(sbe::nu(0), rank);
+}
 
 inline ptr<VoidType> MakeVoidType() { return std::make_shared<VoidType>(); }
 
@@ -2715,7 +2817,7 @@ inline ptr<ITupleType> MakeUninitITupleType() {
 }
 
 inline ptr<MDSpanType> MakeUninitMDSpanType() {
-  return std::make_shared<MDSpanType>(GenUninitShape());
+  return std::make_shared<MDSpanType>(GenUnknownShape());
 }
 
 inline ptr<MDSpanType> MakeRankedMDSpanType(size_t n) {
@@ -2727,35 +2829,51 @@ inline ptr<MDSpanType> MakeMDSpanType(const Shape& v) {
   return std::make_shared<MDSpanType>(v);
 }
 
+inline ptr<SpannedType>
+MakeDenseSpannedType(BaseType t, const Shape& v,
+                     const Storage& s = Storage::DEFAULT) {
+  auto strides = v.GenDenseStrides();
+  return std::make_shared<SpannedType>(t, MakeMDSpanType(v), strides, s);
+}
+
 inline ptr<SpannedType> MakeSpannedType(BaseType t, const Shape& v,
+                                        const ValueList& strd,
                                         const Storage& s = Storage::DEFAULT) {
-  return std::make_shared<SpannedType>(t, MakeMDSpanType(v), s);
+  return std::make_shared<SpannedType>(t, MakeMDSpanType(v), strd, s);
 }
 
 // all the values are fake. it is used only to indicate a spanned type without
 // the shape detail
 inline ptr<SpannedType> MakeDummySpannedType() {
-  return MakeSpannedType(BaseType::UNKSCALAR, GenUninitShape(),
+  return MakeSpannedType(BaseType::UNKSCALAR, GenUnknownShape(), {},
                          Storage::DEFAULT);
 }
 
 inline ptr<SpannedType>
 MakeUnRankedSpannedType(BaseType bt, Storage sto = Storage::DEFAULT) {
   // only care about the rank of span
-  return MakeSpannedType(bt, GenUninitShape(), sto);
+  return MakeSpannedType(bt, GenUnknownShape(), {}, sto);
 }
 
 inline ptr<SpannedType> MakeRankedSpannedType(size_t n,
                                               BaseType bt = BaseType::UNKSCALAR,
                                               Storage sto = Storage::DEFAULT) {
+  if (!IsValidRank(n)) MakeUnRankedSpannedType(bt, sto);
   // only care about the rank of span
-  return MakeSpannedType(bt, Shape(n), sto);
+  return MakeSpannedType(bt, Shape(n), {}, sto);
 }
 
 inline ptr<SpannedType>
-MakeShapedSpannedType(const Shape& s, BaseType bt = BaseType::UNKSCALAR) {
+MakeShapedDenseSpannedType(const Shape& s, BaseType bt = BaseType::UNKSCALAR) {
   // only care about the precise shape
-  return MakeSpannedType(bt, s, Storage::DEFAULT);
+  return MakeDenseSpannedType(bt, s, Storage::DEFAULT);
+}
+
+inline ptr<SpannedType>
+MakeShapedStridedSpannedType(const Shape& s, const ValueList& strd,
+                             BaseType bt = BaseType::UNKSCALAR) {
+  // only care about the precise shape
+  return MakeSpannedType(bt, s, strd, Storage::DEFAULT);
 }
 
 inline ptr<BoundedIntegerType> MakeBoundedIntegerType(int ub) {
@@ -2808,30 +2926,63 @@ MakeBoundedITupleType(const MultiBounds& lb, const MultiBounds& ub,
 }
 
 inline ptr<BoundedITupleType> MakeUninitBoundedITupleType() {
-  return std::make_shared<BoundedITupleType>(GenUninitShape(), GenUninitShape(),
-                                             IntegerList(), "");
+  return std::make_shared<BoundedITupleType>(
+      GenUnknownShape(), GenUnknownShape(), IntegerList(), "");
+}
+
+inline ptr<ArrayType> MakeArrayType(const ValueList& ad) {
+  return std::make_shared<ArrayType>(ad);
+}
+
+inline ptr<ArrayType> MakeRankedArrayType(size_t rank) {
+  return std::make_shared<ArrayType>(rank);
 }
 
 inline ptr<EventType> MakeEventType(Storage s) {
   return std::make_shared<EventType>(s);
 }
 
-inline ptr<EventArrayType>
-MakeEventArrayType(Storage s, std::initializer_list<size_t> ec) {
-  return std::make_shared<EventArrayType>(s, ec);
-}
-
-inline ptr<EventArrayType> MakeEventArrayType(Storage s,
-                                              const std::vector<size_t>& ad) {
+inline ptr<EventArrayType> MakeEventArrayType(Storage s, const ValueList& ad) {
   return std::make_shared<EventArrayType>(s, ad);
 }
 
 inline ptr<SpannedArrayType>
-MakeSpannedArrayType(BaseType ft, const Shape& v,
-                     const std::vector<size_t> ad = {},
-                     const Storage& s = Storage::DEFAULT) {
-  return std::make_shared<SpannedArrayType>((BaseType)ft, MakeMDSpanType(v), s,
+MakeDenseSpannedArrayType(BaseType bt, const Shape& v, const ValueList& ad,
+                          const Storage& s = Storage::DEFAULT) {
+  auto strides = v.GenDenseStrides();
+  return std::make_shared<SpannedArrayType>(bt, MakeMDSpanType(v), strides, s,
                                             ad);
+}
+
+inline ptr<SpannedArrayType>
+MakeRankedSpannedArrayType(size_t n, const ValueList& ad,
+                           BaseType bt = BaseType::UNKSCALAR,
+                           const Storage& s = Storage::DEFAULT) {
+  // only care about the rank of span
+  return std::make_shared<SpannedArrayType>(bt, MakeMDSpanType(Shape(n)),
+                                            ValueList{}, s, ad);
+}
+
+inline ptr<SpannedArrayType>
+MakeUnRankedSpannedArrayType(BaseType bt, const ValueList& ad,
+                             const Storage& sto = Storage::DEFAULT) {
+  // only care about the rank of span
+  return std::make_shared<SpannedArrayType>(
+      bt, MakeMDSpanType(GenUnknownShape()), ValueList{}, sto, ad);
+}
+
+inline ptr<SpannedArrayType>
+MakeStridedSpannedArrayType(BaseType ft, const Shape& v, const ValueList& strd,
+                            const ValueList& ad,
+                            const Storage& s = Storage::DEFAULT) {
+  return std::make_shared<SpannedArrayType>(ft, MakeMDSpanType(v), strd, s, ad);
+}
+
+// like MakeDummySpannedType, but the array dim are real.;
+inline ptr<SpannedArrayType> MakeDummySpannedArrayType(const ValueList& ad) {
+  return std::make_shared<SpannedArrayType>(BaseType::UNKSCALAR,
+                                            MakeMDSpanType(GenUnknownShape()),
+                                            ValueList{}, Storage::DEFAULT, ad);
 }
 
 inline ptr<FutureType> MakeFutureType(const ptr<SpannedType>& v, bool async) {
@@ -2843,8 +2994,10 @@ inline ptr<FutureType> MakeRankedFutureType(size_t n, bool async) {
 }
 
 inline ptr<FutureType> MakeShapedFutureType(const Shape& v, bool async,
+                                            const ValueList strd,
                                             BaseType bt = BaseType::UNKNOWN) {
-  return std::make_shared<FutureType>(MakeShapedSpannedType(v, bt), async);
+  return std::make_shared<FutureType>(MakeShapedStridedSpannedType(v, strd, bt),
+                                      async);
 }
 
 inline ptr<FutureType> MakeDummyFutureType(bool async) {
@@ -2875,7 +3028,7 @@ inline ptr<DeviceDataType> MakeDeviceDataType(const std::string& name,
 inline ptr<Type> MakeChoreoDataType(const ptr<DeviceDataType>& dt) {
   if (dt->is_pointer) {
     if (IsNumericType(dt->data_type) || dt->data_type == BaseType::VOID)
-      return MakeSpannedType(dt->data_type, GenUninitShape());
+      return MakeUnRankedSpannedType(dt->data_type);
     else
       return MakeDummySpannedType();
   } else {
@@ -2899,14 +3052,17 @@ inline ptr<FunctionType> MakeFunctionType(const ptr<Type> ot,
 inline static ptr<Type> ShadowTypeStorage(const ptr<Type>& ty) {
   if (auto sty = dyn_cast<SpannedType>(ty)) {
     if (auto at = dyn_cast<ArrayType>(ty))
-      return MakeSpannedArrayType(sty->ElementType(), sty->GetShape(), at->dims,
-                                  ProjectStorage(sty->GetStorage()));
+      return MakeStridedSpannedArrayType(sty->ElementType(), sty->GetShape(),
+                                         sty->GetStrides(), at->dims,
+                                         ProjectStorage(sty->GetStorage()));
     else
       return MakeSpannedType(sty->ElementType(), sty->GetShape(),
+                             sty->GetStrides(),
                              ProjectStorage(sty->GetStorage()));
   } else if (auto fty = dyn_cast<FutureType>(ty)) {
     auto sty = fty->GetSpannedType();
     return MakeFutureType(MakeSpannedType(sty->ElementType(), sty->GetShape(),
+                                          sty->GetStrides(),
                                           ProjectStorage(sty->GetStorage())),
                           fty->IsAsync());
   } else
@@ -2918,8 +3074,9 @@ inline static ptr<SpannedType> GetSpannedType(const ptr<Type>& ty) {
     return fty->GetSpannedType();
   else if (auto sty = dyn_cast<SpannedType>(ty))
     return sty;
-  else
-    return nullptr;
+  else if (auto saty = dyn_cast<SpannedArrayType>(ty))
+    return saty->spty;
+  return nullptr;
 }
 
 inline static ptr<MDSpanType> GetMDSpanType(const ptr<Type>& ty) {
@@ -2944,6 +3101,11 @@ inline static Shape GetShape(const ptr<Type>& ty) {
     return bty->GetSizes();
 
   return Shape(); // avoid warning
+}
+
+inline static ValueList GetArrayDimensions(const ptr<Type>& ty) {
+  if (auto aty = dyn_cast<ArrayType>(ty)) return aty->Dimensions();
+  return {};
 }
 
 inline static bool GeneralFutureType(const Type& ty) {
@@ -3117,6 +3279,10 @@ inline bool SupportIntListCollapse(const ptr<Type>& ty) {
 inline bool CanYieldDimension(const ptr<Type>& ty) {
   return (isa<ScalarIntegerType>(ty) || (isa<ITupleType>(ty))) &&
          !IsMutable(*ty);
+}
+
+inline bool CompatibleRank(size_t r1, size_t r2) {
+  return r1 == r2 || IsUnknownRank(r1) || IsUnknownRank(r2);
 }
 
 } // end namespace Choreo

@@ -289,7 +289,7 @@ public:
   bool Visit(AST::ChunkAt& n) {
     TraceEachVisit(n);
     for (auto tsi : n.AllOperations()) {
-      for (auto& tile_factor : tsi->GetIndices()) {
+      for (auto& tile_factor : tsi->IndexNodes()) {
         // from ChunkAt nodes, find out who uses host-side IV at device code
         if (std::find(buffer_list_tiled_by_host_iv.begin(),
                       buffer_list_tiled_by_host_iv.end(),
@@ -323,7 +323,8 @@ public:
                                          tiler_shape.ValueAt(i));
             }
             auto chunkat_shape = Shape(data_shape.Rank(), new_shape_values);
-            auto new_chunkat_ty = MakeSpannedType(
+            // TODO: is it dense?
+            auto new_chunkat_ty = MakeDenseSpannedType(
                 GetBaseType(*ty_data), chunkat_shape, Storage::GLOBAL);
 
             // create new AST nodes, and rewrite
@@ -338,7 +339,7 @@ public:
             auto mv_node = AST::Make<AST::MultiValues>(dnode_id->loc);
             mv_node->Append(tiler_node);
             std::vector<ptr<AST::SpannedOperation>> nso;
-            auto so = AST::Make<AST::SpannedOperation>(dnode_id->loc, mv_node);
+            auto so = AST::Make<AST::SOP::Tiling>(dnode_id->loc, mv_node);
             so->SetBlockShape(n.GetBlockShape());
             nso.push_back(so);
 
@@ -564,12 +565,7 @@ public:
     auto future_name = ((n.future.empty()) ? "" : InScopeName(n.future));
     if (n.future.empty() || FBInfo()[future_name].buffer.empty()) {
       // It requires to generate an anonymous buffer for "=> local/share/global"
-      auto ty = NodeType(n);
-      auto shape = cast<FutureType>(ty)->GetShape();
-      auto fty = GetSpannedType(NodeType(*cast<AST::ChunkAt>(n.from)->data));
-      assert(fty);
-      auto sty = MakeSpannedType(fty->ElementType(), shape,
-                                 cast<AST::Memory>(n.to)->Get());
+      auto sty = cast<SpannedType>(NodeType(*n.GetTo()));
 
       auto to_buffer_name = ProperBufferName(n.future);
       // Note: Later passes only cares about the type. So it is possible to

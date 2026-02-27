@@ -22,8 +22,6 @@ __*
 tests/standalone/*.test
 tests/standalone/*.cutest
 
-tests/*.sh
-
 extern/clang-format*
 
 !extern/Makefile

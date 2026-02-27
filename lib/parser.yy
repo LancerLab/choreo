@@ -14,6 +14,7 @@
 // guard the conflict count
 %expect 0
 
+// code is placed to the generated header
 %code requires {
 
 #include "loc.hpp"
@@ -29,21 +30,6 @@ struct SymbolWithInitVal {
   SymbolWithInitVal(const std::string & n, T i) : name(n), init_val(i) {}
 };
 
-struct DMAOperationWithSwizzle {
-  std::string operation;
-  int swizzle_value;
-  bool sparse;
-  int sparse_n;
-  int sparse_m;
-  DMAOperationWithSwizzle()
-      : operation(""), swizzle_value(0), sparse(false), sparse_n(0),
-        sparse_m(0) {}
-  DMAOperationWithSwizzle(const std::string& op, int swizzle, bool sp = false,
-                          int sp_n = 0, int sp_m = 0)
-      : operation(op), swizzle_value(swizzle), sparse(sp), sparse_n(sp_n),
-        sparse_m(sp_m) {}
-};
-
 class PContext {
 private:
   size_t error_count = 0;
@@ -53,8 +39,18 @@ public:
   bool HasError() { return error_count > 0; }
   void recordError() { error_count++; }
 };
+
+namespace Choreo {
+  void info(const location &loc , const std::string &message);
 }
 
+} // %code requires
+
+// inject into Parser class
+%code provides {
+} // %code provide
+
+// go into the generated source file
 %code top {
 
 #include <stdio.h>
@@ -76,6 +72,7 @@ extern AST::Program root;
 extern Choreo::SymbolTable symtab;
 
 const char* color_red = "\033[31m";
+const char* color_blue = "\033[34m";
 const char* color_reset = "\033[0m";
 const char* color_green = "\033[32m";
 
@@ -108,22 +105,14 @@ static bool ignore_fndata = false;
 std::pair<ptr<AST::Identifier>, ptr<AST::MultiValues>> ElementMultiValues(const ptr<AST::Expr>&);
 std::set<std::string> paraby_symbols;
 
-inline ptr<AST::SpannedOperation> OptSpannedOperation(const ptr<AST::SpannedOperation> &);
+inline const ptr<AST::MultiValues> DeSugerDimensions(const ptr<AST::MultiValues> &, bool = true, bool = false);
+inline const ptr<AST::MultiValues> UBoundAll(const ptr<AST::MultiValues> &, bool = false);
 
-}
+} // %code top
 
 %{
 #include <stdio.h>
 extern int yylex();
-
-void choreo_info(const char *message) {
-    // fprintf(stderr, "Error: %s\n", s);
-  errs() << ((should_use_colors()) ? color_green : "") << "Info: "
-         << ((should_use_colors()) ? color_reset : "");
-  errs() << message << "\n";
-  errs() << "Info location: " << ::loc << "\n";
-}
-
 %}
 
 // make yylex() expects one parameter of type 'Choreo::Scanner &'
@@ -207,21 +196,23 @@ void choreo_info(const char *message) {
 %token <Choreo::BaseType> F64 TF32 F32 F16 BF16 F8_E4M3 F8_E5M2 F8_UE4M3 F8_UE8M0 F6_E2M3 F6_E3M2 F4_E2M1
 %token <Choreo::BaseType> BIN1 U1 U2 S2 U4 S4 U6 S6 U8 S8 U16 S16  U32 S32 U64 S64 BOOL VOID INT
 // builtin operations
-%token <std::string> DMA TMA COPY PAD TRANSPOSE NONE ASYNC FNSPAN FNDATA FNMDATA FNSPANAS CHUNKAT CHUNK SUBSPAN MODSPAN STRIDE AT WAIT CALL AUTO SELECT SWAP ROTATE SYNC CHUNKINBOUND ASSERT TRIGGER PRINT PRINTLN SWIZZLE SP SPLPAREN
+%token <std::string> DMA TMA COPY PAD TRANSPOSE NONE ASYNC FNSPAN FNDATA FNMDATA FNSPANAS VIEW FROM CHUNKAT CHUNK SUBSPAN MODSPAN ZFILL STEP STRIDE AT WAIT CALL AUTO SELECT SWAP ROTATE SYNC CHUNKINBOUND ASSERT TRIGGER PRINT PRINTLN SWIZZLE SPARSE SPLPAREN
 // MMA related builtin operations
-%token <std::string> MMA FILL LOAD STORE ROW COLUMN
+%token <std::string> MMA FILL LOAD STORE ROW COLUMN COMMIT SCALE
 %token <std::string> ACOS ASIN ATAN ATAN2 CEIL COS COSH EXP EXPM1 FLOOR GELU ISFINITE ROUND RSQRT SIGMOID SINH SOFTPLUS SQRT TAN LOG1P LOG POW SIGN SIN TANH ALIGNUP ALIGNDOWN BIF_MMA
+%token <std::string> FRAG
 // control related
 %token <std::string> INTHDS IF ELSE PARA BY WITH IN FOREACH INCR RET WHERE WHILE BREAK CONTINUE
 %token <std::string> VECTORIZE
 
 // non-terminals
 %nterm <std::string> builtin_print_func arith_operation spanid cstrings arith_builtin_func align_func id_with_namespace
-%nterm <ptr<DMAConfig>> dma_config swizzle_config
-%nterm <DMAOperationWithSwizzle> dma_operation_swizzle
+%nterm <ptr<DMAConfig>> dma_config
+%nterm <Choreo::SwizMode> swiz_mode swiz_value
+%nterm <std::string> dma_operation
+%nterm <AST::DMAAttribute> dma_attrib
 %nterm <bool> bool_value sync_type pass_by_ref tdma
-%nterm <int> integer_value index_or_none const_sizeof swizzle_value
-%nterm <std::vector<size_t>> optional_array_dims
+%nterm <int> integer_value index_or_none const_sizeof
 %nterm <Choreo::BaseType> fundamental_type
 %nterm <AST::ptr<AST::CppSourceCode>> host_code inlcpp_stmt
 
@@ -230,13 +221,13 @@ void choreo_info(const char *message) {
 %nterm <std::vector<AST::ptr<Choreo::DeviceDataType>>> device_params
 %nterm <AST::ptr<Choreo::DeviceDataType>> device_type device_base_type device_complex_type device_param device_nested_type_list device_nested_type
 %nterm <AST::ptr<AST::Memory>> storage_qual
-%nterm <AST::ptr<AST::SpanAs>> span_as
 %nterm <AST::ptr<AST::IntLiteral>> num_expr
 %nterm <AST::ptr<AST::Call>> call_stmt
 %nterm <AST::ptr<AST::Node>> any_code device_code foreach_block simple_val template_val int_or_id device_passable declaration statement assignment dma_stmt mma_stmt wait_stmt trigger_stmt swap_stmt break_stmt continue_stmt range_expr param_mdspan_val chunkat_or_storage_or_select returnable span_init_val
 %nterm <AST::ptr<AST::MultiNodes>> statements declarations assignments withins where_binds where_clause multi_decls named_spanned_decls spanned_decls named_scalar_decls scalar_decls named_event_decls event_decls stmts_block
-%nterm <AST::ptr<AST::MultiValues>> value_list g_value_list template_value_list param_mdspan_list range_exprs iv_list id_list with_matchers device_passables template_params ids_list subscriptions data_indices suffix_exprs
-%nterm <AST::ptr<AST::Expr>> s_expr g_expr template_value_expr mdspan_expr mdspan_operator mdspan_val_expr ids_expr bound_expr subscript_like_expr dataid_expr call_expr ituple_derivation internal_sizeof_expr sizeof_expr
+%nterm <AST::ptr<AST::MultiValues>> value_list g_value_list template_value_list param_mdspan_list range_exprs iv_list id_list with_matchers device_passables template_params ids_list subscriptions data_indices suffix_exprs optional_array_dims step_list opt_step_list opt_stride_list at_list opt_at_list opt_from_list
+%nterm <std::pair<AST::ptr<AST::MultiValues>, AST::ptr<AST::MultiValues>>> shape_stride
+%nterm <AST::ptr<AST::Expr>> s_expr g_expr template_value_expr mdspan_expr mdspan_operator mdspan_val_expr ids_expr bound_expr subscript_like_expr dataid_expr call_expr ituple_derivation internal_sizeof_expr sizeof_expr frag_expr
 %nterm <AST::ptr<AST::AttributeExpr>> suffix_expr
 %nterm <AST::ptr<AST::DataType>> scalar_type void_type auto_type param_type return_type mdspan_as_type
 %nterm <AST::ptr<AST::DataAccess>> data_element
@@ -689,7 +680,7 @@ parameter
     | param_storage param_type pass_by_ref IDENTIFIER { /* handle parameter type and name here */
         symtab.AddSymbol($4, $2->GetType());
         $$ = AST::Make<AST::Parameter>(@1, $2, AST::Make<AST::Identifier>(@4, $4), $3, ParamAttr::GLOBAL_INPUT);
-        
+
       }
     | param_storage param_type pass_by_ref {
         $$ = AST::Make<AST::Parameter>(@1, $2, AST::Make<AST::Identifier>(@2), $3, ParamAttr::GLOBAL_INPUT);
@@ -775,7 +766,7 @@ paraby_block
 parabys
     : parabys COMMA paraby note_pl {
         // add the paraby as the first stmt of inner-most parallel-by
-        $1->SetLevel($4);
+        $3->SetLevel($4);
         auto pb = $1;
         while (!pb->stmts->None() && isa<AST::ParallelBy>(pb->stmts->SubAt(0)))
           pb = cast<AST::ParallelBy>(pb->stmts->SubAt(0));
@@ -892,7 +883,7 @@ multi_decls
 
 named_scalar_decls
     : MUTABLE scalar_type scalar_decls {
-        assert($2->isScalar() && "Not a scalar type.");
+        assert($2->IsScalar() && "Not a scalar type.");
         $2->SetMutable(true);
         $2->ReGenSemaType();
         for (auto sub : $3->AllSubs()) {
@@ -905,7 +896,7 @@ named_scalar_decls
         $$ = $3;
       }
     | scalar_type scalar_decls {
-        assert($1->isScalar() && "Not a scalar type.");
+        assert($1->IsScalar() && "Not a scalar type.");
         for (auto sub : $2->AllSubs()) {
           auto decl = cast<AST::NamedVariableDecl>(sub);
           decl->type = cast<AST::DataType>($1->Clone());
@@ -997,7 +988,8 @@ event_decls
 event_decl
     : IDENTIFIER optional_array_dims {
         $$ = AST::Make<AST::NamedVariableDecl>(@1, $1,
-             AST::Make<AST::DataType>(@1, BaseType::EVENT, $2), nullptr, $2);
+             AST::Make<AST::DataType>(@1, BaseType::EVENT, $2), nullptr);
+        $$->SetArrayDims($2);
       }
     ;
 
@@ -1009,7 +1001,8 @@ named_spanned_decls
           symtab.AddSymbol(decl->name_str, $2->GetType()->Clone());
           decl->type = cast<AST::DataType>($2->Clone());
           if (decl->IsArray()) {
-            decl->type->array_dims = decl->ArrayDimensions();
+            // uninit array_dims in type
+            decl->type->array_dims = GenUninitValueList(decl->ArrayDimensions()->Count());
             decl->type->ReGenSemaType();
           }
           decl->mem = cast<AST::Memory>(mem->Clone());
@@ -1024,7 +1017,8 @@ named_spanned_decls
           symtab.AddSymbol(decl->name_str, $1->GetType()->Clone());
           decl->type = cast<AST::DataType>($1->Clone());
           if (decl->IsArray()) {
-            decl->type->array_dims = decl->ArrayDimensions();
+            // uninit array_dims in type
+            decl->type->array_dims = GenUninitValueList(decl->ArrayDimensions()->Count());
             decl->type->ReGenSemaType();
           }
           decl->mem = cast<AST::Memory>(mem->Clone());
@@ -1047,23 +1041,30 @@ spanned_decls
 
 spanned_decl
     : IDENTIFIER optional_array_dims {
-        $$ = AST::Make<AST::NamedVariableDecl>(@1, $1, nullptr, nullptr, nullptr, $2);
+        $$ = AST::Make<AST::NamedVariableDecl>(@1, $1);
+        $$->SetArrayDims($2);
       }
     | IDENTIFIER optional_array_dims span_init_val {
-        $$ = AST::Make<AST::NamedVariableDecl>(@1, $1, nullptr, nullptr, nullptr, $2, $3);
+        $$ = AST::Make<AST::NamedVariableDecl>(@1, $1, nullptr, nullptr, nullptr, $3);
+        $$->SetArrayDims($2);
       }
     ;
 
 optional_array_dims
     : /*empty*/ {}
-    | optional_array_dims LBRAKT NUM RBRAKT {
-        $1.push_back($3);
+    | optional_array_dims LBRAKT s_expr RBRAKT {
+        if ($1 == nullptr) {
+          $1 = AST::Make<AST::MultiValues>(loc);
+          $1->AddNote("array_dims");
+        }
+        $1->Append($3);
         $$ = $1;
       }
     ;
 
 subscriptions
     : LBRAKT s_expr RBRAKT {
+        // TODO: like `optional_array_dims`, consider adding note to do unified check?
         $$ = AST::Make<AST::MultiValues>(loc);
         $$->Append($2);
       }
@@ -1283,6 +1284,7 @@ assignment
           $$ = AST::Make<AST::Assignment>(@2, $1, $3);
         }
       }
+  /*
     | IDENTIFIER ASSIGN ids_expr span_as {
         symtab.AddSymbol($1, MakeUnknownType());
         auto ide = ElementMultiValues($3);
@@ -1293,6 +1295,7 @@ assignment
         // TODO: make it a named variable instead of expr assignment
         // $$ = AST::Make<AST::NamedVariableDecl>(@1, $1, nullptr, nullptr, $5, $4);
       }
+  */
     | IDENTIFIER ASSIGN ituple_derivation {
         $$ = AST::Make<AST::NamedVariableDecl>(@1,
               $1, AST::Make<AST::DataType>(@1, BaseType::ITUPLE), nullptr, $3);
@@ -1338,6 +1341,23 @@ assignment
         } else {
           $$ = AST::Make<AST::Assignment>(@3, cast<AST::DataAccess>($1->Clone()),
                 AST::Make<AST::Expr>(@2, $2, AST::Make<AST::Expr>(@1, $1), $4));
+        }
+      }
+    | IDENTIFIER ASSIGN subdata_expr {
+        symtab.AddSymbol($1, MakeUnknownType());
+        auto & sops = $3->AllOperations();
+        if ((sops.size() == 1) && (isa<AST::SOP::Reshape>($3->FirstOp()))) {
+          auto rop = dyn_cast<AST::SOP::Reshape>($3->FirstOp());
+          //auto expr = AST::Make<AST::Expr>(@1, $3);
+          auto ref_id = AST::Make<AST::Identifier>(@3, $3->RefSymbol());
+          auto id = AST::Make<AST::Identifier>(@1, $1);
+          auto expr = AST::Make<AST::Expr>(@3, AST::Make<AST::SpanAs>(@1, ref_id, rop->GetNewSpan()));
+          $$ = AST::Make<AST::NamedVariableDecl>(@1,
+                $1, AST::Make<AST::DataType>(@1, BaseType::UNKNOWN), nullptr, expr);
+        } else {
+          // TODO: make it a named variable instead of expr assignment
+          // $$ = AST::Make<AST::NamedVariableDecl>(@1, $1, nullptr, nullptr, $5, $4);
+          $$ = AST::Make<AST::Assignment>(@1, $1, AST::Make<AST::Expr>(@1, $3));
         }
       }
     | IDENTIFIER ASSIGN LBRAKT {
@@ -1715,96 +1735,50 @@ tdma
     | TMA { $$ = true; }
     ;
 
+dma_attrib
+    : dma_attrib SWIZZLE swiz_mode { $1.sw_mode = $3; $$ = $1; }
+    | dma_attrib SPARSE { $1.is_sparse = true; $$ = $1; }
+    | dma_attrib SPARSE LT integer_value COL integer_value GT {
+        $1.is_sparse = true;
+        $1.sparse_n = $4;
+        $1.sparse_m = $6;
+        $$ = $1;
+      }
+    | dma_attrib SPARSE LT integer_value COMMA integer_value GT {
+        $1.is_sparse = true;
+        $1.sparse_n = $4;
+        $1.sparse_m = $6;
+        $$ = $1;
+      }
+    | dma_attrib ZFILL { $1.zfill = true; $$ = $1; }
+    | /*empty*/ {}
+    ;
+
 dma_stmt
-    : IDENTIFIER ASSIGN tdma dma_operation_swizzle sync_type dma_config chunkat_expr TRANS chunkat_or_storage_or_select {
+    : IDENTIFIER ASSIGN tdma dma_operation sync_type dma_config dma_attrib chunkat_expr TRANS chunkat_or_storage_or_select {
         symtab.AddSymbol($1, MakeDummyFutureType($5));
-        auto dma = AST::Make<AST::DMA>(@3, $4.operation, $1, $7, $9, $5, $6);
-        dma->SetTMA($3);
-        // Handle swizzle from dma_operation_swizzle (only if explicitly specified in syntax)
-        if ($4.swizzle_value > 0) {
-          dma->SetSwizzleValue($4.swizzle_value);
-          dma->SetSwizzleExplicit(true);
-        }
-        if ($4.sparse) {
-          dma->SetSparse(true);
-          dma->SetSparsePattern($4.sparse_n, $4.sparse_m);
-        }
-        // If swizzle is not specified in dma_operation_swizzle, swizzle_explicit remains false
-        $$ = dma;
+        $$ = AST::Make<AST::DMA>(@3, $4, $1, $8, $10, $5, $7, $3, $6);
       }
-    | IDENTIFIER ASSIGN tdma dma_operation_swizzle sync_type dma_config chunkat_expr TRANS chunkat_or_storage_or_select CHAIN IDENTIFIER {
+    | IDENTIFIER ASSIGN tdma dma_operation sync_type dma_config dma_attrib chunkat_expr TRANS chunkat_or_storage_or_select CHAIN IDENTIFIER {
         symtab.AddSymbol($1, MakeDummyFutureType($5));
-        auto dma = AST::Make<AST::DMA>(@3, $4.operation, $1, $11, $7, $9, $5, $6);
-        dma->SetTMA($3);
-        // Handle swizzle from dma_operation_swizzle (only if explicitly specified in syntax)
-        if ($4.swizzle_value > 0) {
-          dma->SetSwizzleValue($4.swizzle_value);
-          dma->SetSwizzleExplicit(true);
-        }
-        if ($4.sparse) {
-          dma->SetSparse(true);
-          dma->SetSparsePattern($4.sparse_n, $4.sparse_m);
-        }
-        // If swizzle is not specified in dma_operation_swizzle, swizzle_explicit remains false
-        $$ = dma;
+        $$ = AST::Make<AST::DMA>(@3, $4, $1, $12, $8, $10, $5, $7, $3, $6);
       }
-    | tdma dma_operation_swizzle sync_type dma_config chunkat_expr TRANS chunkat_or_storage_or_select {
-        auto dma = AST::Make<AST::DMA>(@1, $2.operation, "", $5, $7, $3, $4);
-        dma->SetTMA($1);
-        // Handle swizzle from dma_operation_swizzle (only if explicitly specified in syntax)
-        if ($2.swizzle_value > 0) {
-          dma->SetSwizzleValue($2.swizzle_value);
-          dma->SetSwizzleExplicit(true);
-        }
-        if ($2.sparse) {
-          dma->SetSparse(true);
-          dma->SetSparsePattern($2.sparse_n, $2.sparse_m);
-        }
-        // If swizzle is not specified in dma_operation_swizzle, swizzle_explicit remains false
-        $$ = dma;
+    | tdma dma_operation sync_type dma_config dma_attrib chunkat_expr TRANS chunkat_or_storage_or_select {
+        $$ = AST::Make<AST::DMA>(@1, $2, "", $6, $8, $3, $5, $1, $4);
       }
-    | tdma dma_operation_swizzle sync_type dma_config chunkat_expr TRANS chunkat_or_storage_or_select CHAIN IDENTIFIER {
-        auto dma = AST::Make<AST::DMA>(@1, $2.operation, "", $9, $5, $7, $3, $4);
-        dma->SetTMA($1);
-        // Handle swizzle from dma_operation_swizzle (only if explicitly specified in syntax)
-        if ($2.swizzle_value > 0) {
-          dma->SetSwizzleValue($2.swizzle_value);
-          dma->SetSwizzleExplicit(true);
-        }
-        if ($2.sparse) {
-          dma->SetSparse(true);
-          dma->SetSparsePattern($2.sparse_n, $2.sparse_m);
-        }
-        // If swizzle is not specified in dma_operation_swizzle, swizzle_explicit remains false
-        $$ = dma;
+    | tdma dma_operation sync_type dma_config dma_attrib chunkat_expr TRANS chunkat_or_storage_or_select CHAIN IDENTIFIER {
+        $$ = AST::Make<AST::DMA>(@1, $2, "", $10, $6, $8, $3, $5, $1, $4);
       }
     | IDENTIFIER ASSIGN tdma NONE {
         symtab.AddSymbol($1, MakePlaceHolderFutureType());
-        auto dma = AST::Make<AST::DMA>(@1, $1);
-        dma->SetTMA($3);
-        $$ = dma;
+        $$ = AST::Make<AST::DMA>(@1, $1, $3);
       }
     ;
 
-dma_operation_swizzle
-    : COPY {
-        $$ = DMAOperationWithSwizzle($1, 0);  // 0 means no swizzle specified
-      }
-    | COPY DOT SWIZZLE LPAREN swizzle_value RPAREN {
-        $$ = DMAOperationWithSwizzle($1, $5);  // explicit swizzle value
-      }
-    | COPY SP {
-        $$ = DMAOperationWithSwizzle($1, 0, true, 2, 4);
-      }
-    | COPY SPLPAREN integer_value COL integer_value RPAREN {
-        $$ = DMAOperationWithSwizzle($1, 0, true, $3, $5);
-      }
-    | PAD {
-        $$ = DMAOperationWithSwizzle($1, 0);
-      }
-    | TRANSPOSE {
-        $$ = DMAOperationWithSwizzle($1, 0);
-      }
+dma_operation
+    : COPY { $$ = $1; }
+    | PAD  { $$ = $1; }
+    | TRANSPOSE { $$ = $1; }
     ;
 
 dma_config
@@ -1828,21 +1802,23 @@ dma_config
     | /* Empty for no config */ { $$ = nullptr; }
     ;
 
-swizzle_value
+swiz_value
     : NUM {
-        if ($1 != 128 && $1 != 64 && $1 != 32) {
+        switch($1) {
+        case 128: $$ = SwizMode::B128; break;
+        case 64: $$ = SwizMode::B64; break;
+        case 32: $$ = SwizMode::B32; break;
+        default: {
           Parser::error(@1, "swizzle value must be 128, 64, or 32");
           YYERROR;
         }
-        $$ = $1;
+        }
       }
     ;
 
-swizzle_config
-    : SWIZZLE LPAREN swizzle_value RPAREN {
-        $$ = AST::Make<SwizzleConfig>($3);
-      }
-    | /* Empty for no swizzle config */ { $$ = nullptr; }
+swiz_mode
+    : LT swiz_value GT { $$ = $2; }
+    | /* Empty for no swizzle config */ { $$ = SwizMode::NONE; }
     ;
 
 sync_type
@@ -1854,13 +1830,6 @@ chunkat_or_storage_or_select
     : { ignore_fndata = true; } chunkat_expr { $$ = $2; ignore_fndata = false; }
     | STORAGE { $$ = AST::Make<AST::Memory>(@1, $1); }
     | select_expr  { $$ = $1; }
-    ;
-
-span_as
-    : FNSPANAS LPAREN g_value_list RPAREN {
-        $$ = AST::Make<AST::SpanAs>(@1, nullptr/*fill later*/, $3);
-        parsing_derivation_decl = false;
-      }
     ;
 
 chunkat_expr
@@ -1882,47 +1851,83 @@ spanned_ops
       }
     ;
 
+step_list
+    : STEP LPAREN value_list RPAREN {
+        $3->SetDelimiter(", ");
+        $$ = $3;
+      }
+    ;
+
+opt_step_list
+    : step_list { $$ = $1; }
+    | /*empty*/ { $$ = nullptr; }
+    ;
+
+opt_stride_list
+    : COL value_list {
+        $2->SetDelimiter(", ");
+        $$ = $2;
+      }
+    | /*empty*/ { $$ = nullptr; }
+    ;
+
+shape_stride
+    : value_list opt_stride_list {
+        $1->SetDelimiter(", ");
+        $$ = std::make_pair($1, $2);
+      }
+    ;
+
+at_list
+    : AT LPAREN value_list RPAREN {
+        $3->SetDelimiter(", ");
+        $$ = $3;
+      }
+    ;
+
+opt_at_list
+    : at_list { $$ = $1; }
+    | /*empty*/ { $$ = nullptr; }
+    ;
+
+opt_from_list
+    : FROM LPAREN value_list RPAREN  {
+        $3->SetDelimiter(", ");
+        $$ = $3;
+      }
+    | /*empty*/ { $$ = nullptr; }
+    ;
+
 spanned_op
     : CHUNKAT LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, $3, AST::SpannedOperation::TILING));
+        auto ds = DeSugerDimensions($3, true, true);
+        if (ds == nullptr) {
+          Choreo::info(@3, "no tiling is applied.");
+          $$ = nullptr;
+        }
+        else
+          $$ = AST::Make<AST::SOP::TileAt>(@1, UBoundAll(ds), $3);
       }
     | CHUNK LPAREN value_list RPAREN AT LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
+        auto ds = DeSugerDimensions($3);
         $7->SetDelimiter(", ");
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, $7, $3, AST::SpannedOperation::TILEAT));
+        $$ = AST::Make<AST::SOP::TileAt>(@1, UBoundAll(ds, true), $7);
       }
-    | SUBSPAN LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
-        auto p = AST::Make<AST::MultiValues>(@3, ", ");
-        for (size_t i = 0; i < $3->Count(); ++i) p->Append(AST::Make<AST::Expr>(@3, AST::Make<AST::IntLiteral>(@3, 0)));
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, p, $3, AST::SpannedOperation::SUBSPAN));
+    | SUBSPAN LPAREN shape_stride RPAREN opt_step_list opt_at_list {
+        auto ds = DeSugerDimensions($3.first, false);
+        $$ = AST::Make<AST::SOP::SubSpan>(@1, ds, $6, $5, $3.second);
       }
-    | SUBSPAN LPAREN value_list RPAREN AT LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
-        $7->SetDelimiter(", ");
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, $7, $3, AST::SpannedOperation::SUBSPAN));
-      }
-    | MODSPAN LPAREN value_list RPAREN AT LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
-        $7->SetDelimiter(", ");
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, $7, $3, AST::SpannedOperation::MODSPAN));
-      }
-    | SUBSPAN LPAREN value_list RPAREN STRIDE LPAREN value_list RPAREN AT LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
-        $7->SetDelimiter(", ");
-        $11->SetDelimiter(", ");
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, $11, $3, $7, AST::SpannedOperation::SUBSPAN));
-      }
-    | MODSPAN LPAREN value_list RPAREN STRIDE LPAREN value_list RPAREN AT LPAREN value_list RPAREN {
-        $3->SetDelimiter(", ");
-        $7->SetDelimiter(", ");
-        $11->SetDelimiter(", ");
-        $$ = OptSpannedOperation(AST::Make<AST::SpannedOperation>(@1, $11, $3, $7, AST::SpannedOperation::MODSPAN));
+    | MODSPAN LPAREN shape_stride RPAREN opt_step_list opt_at_list {
+        auto ds = DeSugerDimensions($3.first, false);
+        $$ = AST::Make<AST::SOP::ModSpan>(@1, ds, $6, $5, $3.second);
       }
     | FNSPANAS LPAREN g_value_list RPAREN {
         $3->SetDelimiter(", ");
-        $$ = AST::Make<AST::SpannedOperation>(@1, $3, AST::SpannedOperation::RESHAPE);
+        $$ = AST::Make<AST::SOP::Reshape>(@1, $3);
+      }
+    | VIEW LPAREN shape_stride RPAREN opt_from_list {
+        auto ds = DeSugerDimensions($3.first, false);
+        $$ = AST::Make<AST::SOP::View>(@1, ds, $5, $3.second);
       }
     ;
 
@@ -1933,43 +1938,85 @@ subdata_expr
       }
     ;
 
+// check sema later
+frag_expr
+    : subscript_like_expr { $$ = $1; }
+    | IDENTIFIER { 
+        $$ = AST::Make<AST::Expr>(@1, AST::Make<AST::Identifier>(@1, $1)); 
+      }
+    ;
+
 mma_stmt
     : IDENTIFIER ASSIGN MMA FILL s_expr {
-        auto op = AST::Make<AST::MMAOperation>($1, $5);
+        // decl
+        auto fexpr = AST::Make<AST::Expr>(@1, AST::Make<AST::Identifier>(@1, $1)); 
+        auto op = AST::Make<AST::MMAOperation>(fexpr, $5, true);
         symtab.AddSymbol($1, MakeUnknownType());
+        $$ = AST::Make<AST::MMA>(@1, op);
+      }
+    | FRAG IDENTIFIER optional_array_dims LBRACE s_expr RBRACE {
+        // decl
+        auto fexpr = AST::Make<AST::Expr>(@2, AST::Make<AST::Identifier>(@2, $2)); 
+        auto op = AST::Make<AST::MMAOperation>(fexpr, $5, true);
+        op->SetFillingArrayDims($3);
+        symtab.AddSymbol($2, MakeUnknownType());
+        $$ = AST::Make<AST::MMA>(@1, op);
+      }
+    | FRAG DOT fundamental_type IDENTIFIER optional_array_dims LBRACE s_expr RBRACE {
+        // decl
+        auto fexpr = AST::Make<AST::Expr>(@4, AST::Make<AST::Identifier>(@4, $4)); 
+        auto op = AST::Make<AST::MMAOperation>(fexpr, $7, true, $3);
+        op->SetFillingArrayDims($5);
+        symtab.AddSymbol($4, MakeUnknownType());
         $$ = AST::Make<AST::MMA>(@1, op);
       }
     | IDENTIFIER ASSIGN MMA FILL DOT fundamental_type s_expr {
-        auto op = AST::Make<AST::MMAOperation>($1, $7, $6);
+        // decl
+        auto fexpr = AST::Make<AST::Expr>(@1, AST::Make<AST::Identifier>(@1, $1)); 
+        auto op = AST::Make<AST::MMAOperation>(fexpr, $7, true, $6);
         symtab.AddSymbol($1, MakeUnknownType());
+        $$ = AST::Make<AST::MMA>(@1, op);
+      }
+    | MMA FILL frag_expr COMMA s_expr {
+        auto op = AST::Make<AST::MMAOperation>($3, $5, false, BaseType::UNKSCALAR);
         $$ = AST::Make<AST::MMA>(@1, op);
       }
     | IDENTIFIER ASSIGN MMA LOAD sync_type chunkat_expr {
-        auto op = AST::Make<AST::MMAOperation>($6, $1, $5);
+        auto fexpr = AST::Make<AST::Expr>(@1, AST::Make<AST::Identifier>(@1, $1)); 
+        auto op = AST::Make<AST::MMAOperation>($6, fexpr, $5);
         symtab.AddSymbol($1, MakeUnknownType());
         $$ = AST::Make<AST::MMA>(@1, op);
       }
-    | IDENTIFIER ASSIGN MMA LOAD DOT SWIZZLE LPAREN swizzle_value RPAREN sync_type chunkat_expr {
-        auto op = AST::Make<AST::MMAOperation>($11, $1, $10, $8);
+    | IDENTIFIER ASSIGN MMA LOAD SWIZZLE swiz_mode sync_type chunkat_expr {
+        auto fexpr = AST::Make<AST::Expr>(@1, AST::Make<AST::Identifier>(@1, $1)); 
+        auto op = AST::Make<AST::MMAOperation>($8, fexpr, $7, $6);
         symtab.AddSymbol($1, MakeUnknownType());
         $$ = AST::Make<AST::MMA>(@1, op);
       }
-    | MMA mma_exec_method IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER {
+    | MMA mma_exec_method frag_expr COMMA frag_expr COMMA frag_expr {
         auto op = AST::Make<AST::MMAOperation>($2, $3, $5, $7);
         $$ = AST::Make<AST::MMA>(@1, op);
       }
-    | MMA mma_exec_method SP IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER {
-        auto op = AST::Make<AST::MMAOperation>($2, $4, $6, $8, true);
+    | MMA mma_exec_method SCALE frag_expr COMMA frag_expr COMMA frag_expr COMMA chunkat_expr COMMA s_expr {
+        auto op = AST::Make<AST::MMAOperation>($2, $4, $6, $8, $10, $12);
         $$ = AST::Make<AST::MMA>(@1, op);
       }
-    | MMA mma_exec_method SP IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER {
+    | MMA mma_exec_method SPARSE frag_expr COMMA frag_expr COMMA frag_expr COMMA frag_expr {
         auto op = AST::Make<AST::MMAOperation>($2, $4, $6, $8, $10, true);
         $$ = AST::Make<AST::MMA>(@1, op);
       }
-    | MMA STORE IDENTIFIER COMMA chunkat_expr {
+    | MMA mma_exec_method SPARSE frag_expr COMMA frag_expr COMMA frag_expr {
+        auto op = AST::Make<AST::MMAOperation>($2, $4, $6, $8, true);
+        $$ = AST::Make<AST::MMA>(@1, op);
+      }
+    | MMA STORE frag_expr COMMA chunkat_expr {
         auto op = AST::Make<AST::MMAOperation>($3, $5);
         $$ = AST::Make<AST::MMA>(@1, op);
       }
+    | MMA COMMIT {
+      auto op = AST::Make<AST::MMAOperation>();
+      $$ = AST::Make<AST::MMA>(@1, op);
+    }
     ;
 
 mma_exec_method
@@ -2077,16 +2124,22 @@ ids_expr /* enforce: either a ref to id or a subscription */
           auto er = cast<AST::Expr>($1->GetR());
           if ((er->op == "elemof") || (er->GetSymbol()))
             $$ = er;
-          else
+          else {
             Parser::error($1->LOC(), "expect a subscription but got a " + $1->op + ".");
+            YYERROR;
+          }
+
         } else if ($1->op == "mdataof") {  // ignore the mdataof
           auto er = cast<AST::Expr>($1->GetR());
           if ((er->op == "elemof") || (er->GetSymbol()))
             $$ = er;
-          else
+          else {
             Parser::error($1->LOC(), "expect a subscription but got a " + $1->op + ".");
+            YYERROR;
+          }
         } else if ($1->op != "elemof") {
           Parser::error($1->LOC(), "expect a subscription but got a " + $1->op + ".");
+          YYERROR;
         } else
           $$ = $1;
       }
@@ -2329,34 +2382,45 @@ ElementMultiValues(const ptr<AST::Expr>&e) {
   return std::make_pair(id, mv);
 }
 
-inline ptr<AST::SpannedOperation> OptSpannedOperation(const ptr<AST::SpannedOperation> &tsi) {
-  if (tsi == nullptr) return nullptr;
+inline const ptr<AST::MultiValues> DeSugerDimensions(const ptr<AST::MultiValues>& mv, bool notile, bool ret_null) {
+  if (mv == nullptr) return nullptr;
 
-  bool not_tiled = true;
-
-  auto no_tiling_norm = [&](ptr<AST::MultiValues> mv) -> void {
-    if (mv == nullptr) return;
-    for (auto v : mv->AllValues()) {
-      if (auto id = AST::GetIdentifier(*v))
-        if (id->name == "_") {
-          id->name = "__choreo_no_tiling__";
-          continue;
-        }
-      not_tiled = false;
-    }
-  };
-
-  switch (tsi->OpCode()) {
-  case AST::SpannedOperation::Kind::TILING: no_tiling_norm(tsi->Positions()); break;
-  case AST::SpannedOperation::Kind::TILEAT: [[fallthrough]];
-  case AST::SpannedOperation::Kind::SUBSPAN: [[fallthrough]];
-  case AST::SpannedOperation::Kind::MODSPAN: no_tiling_norm(tsi->TFSS()); no_tiling_norm(tsi->GetStrides()); break;
-  default: choreo_unreachable("Unexpect SpannedOperation Kind");
+  bool all_notile = true;;
+  for (auto v : mv->AllValues()) {
+    if (auto id = AST::GetIdentifier(*v); id && (id->name == "_")) {
+      if (notile)
+        id->name = "__choreo_no_tiling__";
+      else
+        id->name = "__choreo_parent_dim__";
+    } else
+      all_notile = false;
   }
 
-  if (not_tiled) return nullptr;
+  if (all_notile && ret_null) return nullptr; 
 
-  return tsi;
+  mv->SetDelimiter(", ");
+
+  return mv;
+}
+
+inline const ptr<AST::MultiValues> UBoundAll(const ptr<AST::MultiValues>& mv, bool notile_only) {
+  if (mv == nullptr) return nullptr;
+
+  auto res = AST::Make<AST::MultiValues>(mv->LOC());
+
+  for (auto v : mv->AllValues()) {
+    if (auto id = AST::GetIdentifier(*v); id && (id->name == "__choreo_no_tiling__"))
+      res->Append(AST::MakeIntExpr(id->LOC(), 1));
+    else {
+      if (notile_only)
+        res->Append(v);
+      else
+        res->Append(AST::Make<AST::Expr>(v->LOC(), "ubound", v->Clone()));
+    }
+  }
+  res->SetDelimiter(", ");
+
+  return res;
 }
 
 // Bison expects us to provide implementation - otherwise linker complains
@@ -2382,4 +2446,27 @@ void Parser::error(const location &loc , const std::string &message) {
   }
 
   pctx.recordError();
+}
+
+void Choreo::info(const location &loc , const std::string &message) {
+  if (CCtx().InhibitWarning()) return;
+  errs() << loc << ": ";
+  errs() << ((should_use_colors()) ? color_blue: "") << "info: "
+         << ((should_use_colors()) ? color_reset : "");
+  errs() << message << "\n";
+
+  if (!CCtx().ShowSourceLocation()) return;
+
+  // Retrieve the line that caused the error
+  std::string error_line = CCtx().GetSourceLine(loc.begin.line);
+  if (!error_line.empty()) {
+    errs() << "  " << error_line << "\n"; // Print the source line
+
+    // Print caret (^) under the error position
+    errs() << "  ";
+    for (int i = 1; i < loc.begin.column; ++i)
+      errs() << " "; // Align the caret with the exact error position
+
+    errs() << "^" << "\n";
+  }
 }

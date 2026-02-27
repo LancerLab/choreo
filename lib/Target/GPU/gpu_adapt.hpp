@@ -58,6 +58,7 @@ private:
   std::stack<ParallelLevel> levels;
   std::string cur_fname;
   std::string cur_arch;
+  bool has_stream_param;
 
   ParallelSymbols ps;
 
@@ -73,6 +74,7 @@ private:
       ps.Reset();
       cur_params.clear();
       cur_fname = cf->name;
+      has_stream_param = false;
       levels.push(ParallelLevel::SEQ);
     } else if (auto pb = dyn_cast<AST::ParallelBy>(&n)) {
       auto lvl = pb->GetLevel();
@@ -344,20 +346,13 @@ public:
       // TODO: offset limitation: [0, 2^24)
       if (f_rank == 5) {
         for (auto tsi : f_ca->AllOperations()) {
-          if (tsi->SpecifyReshape()) continue;
-          auto first = tsi->Positions()->ValueAt(0);
-          auto t = dyn_cast<BoundedITupleType>(first->GetType());
-          assert(t != nullptr);
-          if (VIIsInt(t->ubounds.ValueAt(0))) {
-            if (!IsValueItemEqual(1, t->ubounds.ValueAt(0)))
+          if (auto indices = tsi->GetIndices()) {
+            auto val = indices->Opts().GetVals()[0];
+            if (VIIsInt(val) && !IsValueItemEqual(1, val))
               Error1(n.LOC(), "On " + cur_arch +
                                   ", dma.copy(slice) does not "
                                   "support 5-dimensional "
                                   "array (if dim is 5, offsets[0] must be 0).");
-          } else {
-            choreo_unreachable("unexpected situation");
-            // TODO
-            // Is that the case?
           }
         }
       }
@@ -374,20 +369,13 @@ public:
       // TODO: offset limitation: [0, 2^24)
       if (t_rank == 5) {
         for (auto tsi : t_ca->AllOperations()) {
-          if (tsi->SpecifyReshape()) continue;
-          auto first = tsi->Positions()->ValueAt(0);
-          auto t = dyn_cast<BoundedITupleType>(first->GetType());
-          assert(t != nullptr);
-          if (VIIsInt(t->ubounds.ValueAt(0))) {
-            if (!IsValueItemEqual(1, t->ubounds.ValueAt(0)))
+          if (auto indices = tsi->GetIndices()) {
+            auto val = indices->Opts().GetVals()[0];
+            if (VIIsInt(val) && !IsValueItemEqual(1, val))
               Error1(n.LOC(), "On " + cur_arch +
                                   ", dma.copy(deslice) does not "
                                   "support 5-dimensional "
                                   "array (if dim is 5, offsets[0] must be 0).");
-          } else {
-            choreo_unreachable("unexpected situation");
-            // TODO
-            // Is that the case?
           }
         }
       }
@@ -649,6 +637,11 @@ public:
   }
 
   bool Visit(AST::Parameter& n) override {
+    auto ty = GetSymbolType(n.sym->name);
+    if (isa<StreamType>(ty)) {
+      if (has_stream_param) Error1(n.LOC(), "Only one stream supported now!");
+      has_stream_param = true;
+    }
     if (n.sym) cur_params.emplace(InScopeName(n.sym->name), &n);
     return true;
   }
@@ -751,12 +744,18 @@ public:
     auto& op = *n.GetOperation();
     ValueList mma_shape;
     switch (op.Tag()) {
-    case AST::MMAOperation::Fill: break;
+    case AST::MMAOperation::Fill: {
+      auto sym = AST::FragName(op.FillingTo());
+      auto& ssmi = cgi.GetSymbolMMA(InScopeName(sym));
+      if (ssmi.frag != MMAInfo::FRAG_C && ssmi.frag != MMAInfo::FRAG_UNK)
+        Error1(n.LOC(),
+               "Only the acc of mma operation can be used in fill op.");
+    } break;
     case AST::MMAOperation::Load: break;
     case AST::MMAOperation::Exec: {
-      auto& a_sym = op.ExecOperand(1);
-      auto& b_sym = op.ExecOperand(2);
-      auto& c_sym = op.ExecOperand(0);
+      auto& a_sym = AST::FragName(op.ExecOperand(1));
+      auto& b_sym = AST::FragName(op.ExecOperand(2));
+      auto& c_sym = AST::FragName(op.ExecOperand(0));
       auto a_sty = GetSpannedType(GetSymbolType(a_sym));
       auto b_sty = GetSpannedType(GetSymbolType(b_sym));
       auto c_sty = GetSpannedType(GetSymbolType(c_sym));
@@ -767,9 +766,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(0));
         mma_shape.push_back(b_shape.ValueAt(0));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(1), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(1) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(1));
         break;
@@ -777,9 +774,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(0));
         mma_shape.push_back(b_shape.ValueAt(1));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(1), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(1) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(1));
         break;
@@ -787,9 +782,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(1));
         mma_shape.push_back(b_shape.ValueAt(0));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(0), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(0) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(0));
         break;
@@ -797,9 +790,7 @@ public:
         mma_shape.push_back(a_shape.ValueAt(1));
         mma_shape.push_back(b_shape.ValueAt(1));
         if (op.IsSparse())
-          mma_shape.push_back(
-              sbe::bop(OpCode::MULTIPLY, a_shape.ValueAt(0), sbe::nu(2))
-                  ->Normalize());
+          mma_shape.push_back(a_shape.ValueAt(0) * sbe::nu(2));
         else
           mma_shape.push_back(a_shape.ValueAt(0));
         break;
@@ -811,7 +802,6 @@ public:
         oss << "m" << STR(s[0]) << "n" << STR(s[1]) << "k" << STR(s[2]);
         return oss.str();
       };
-#if 1
       auto a_ty = a_sty->ElementType();
       auto b_ty = b_sty->ElementType();
       auto c_ty = c_sty->ElementType();
@@ -847,9 +837,12 @@ public:
       FCtx(cur_fname).SetFragMMAType(InScopeName(a_sym), mma_ty);
       FCtx(cur_fname).SetFragMMAType(InScopeName(b_sym), mma_ty);
       FCtx(cur_fname).SetFragMMAType(InScopeName(c_sym), mma_ty);
-      if (op.IsSparse() && !op.ExecOperand(3).empty()) {
-        FCtx(cur_fname).SetFragMMAType(InScopeName(op.ExecOperand(3)), mma_ty);
-      }
+
+      std::string e_sym = "";
+      if (op.ExecOperand(3)) e_sym = AST::FragName(op.ExecOperand(3));
+
+      if (op.IsSparse() && !e_sym.empty())
+        FCtx(cur_fname).SetFragMMAType(InScopeName(e_sym), mma_ty);
 
       // TODO: consider to merge predicate
       if (mma_ty == MMAType::CTMMA) {
@@ -857,51 +850,17 @@ public:
         FCtx(cur_fname).SetMMAPolicyOfFrag(InScopeName(a_sym), mma_policy);
         FCtx(cur_fname).SetMMAPolicyOfFrag(InScopeName(b_sym), mma_policy);
         FCtx(cur_fname).SetMMAPolicyOfFrag(InScopeName(c_sym), mma_policy);
-        if (op.IsSparse() && !op.ExecOperand(3).empty()) {
-          FCtx(cur_fname).SetMMAPolicyOfFrag(InScopeName(op.ExecOperand(3)),
-                                             mma_policy);
-        }
+        if (op.IsSparse() && !e_sym.empty())
+          FCtx(cur_fname).SetMMAPolicyOfFrag(InScopeName(e_sym), mma_policy);
       } else if (mma_ty == MMAType::WGMMA) {
         std::string mma_policy = MMALimit::MMAConfig2WGMMAName(mma_config);
         FCtx(cur_fname).SetMMAPolicyOfFrag(InScopeName(c_sym), mma_policy);
       }
-#else
-      auto ety = a_ty->ElementType();
-      switch (ety) {
-      case BaseType::F16:
-        if (!sbe::ceq(mma_shape[0], sbe::nu(16)) ||
-            !sbe::ceq(mma_shape[1], sbe::nu(16)) ||
-            !sbe::ceq(mma_shape[2], sbe::nu(16)))
-          Error1(n.LOC(), "MMA [" + STR(ety) + ": " + MMAShapeSTR(mma_shape) +
-                              "] is not support by current architecture(" +
-                              CCtx().GetArch() + ").");
-        break;
-      case BaseType::F32:
-        if (sbe::ceq(mma_shape[0], sbe::nu(16)) ||
-            sbe::ceq(mma_shape[1], sbe::nu(16)) ||
-            sbe::ceq(mma_shape[2], sbe::nu(8)))
-          return true;
-        else if (sbe::ceq(mma_shape[0], sbe::nu(16)) ||
-                 sbe::ceq(mma_shape[1], sbe::nu(16)) ||
-                 sbe::ceq(mma_shape[2], sbe::nu(16))) {
-          // support tf32 mma here
-          Error1(n.LOC(), "MMA [" + STR(ety) + ": " + MMAShapeSTR(mma_shape) +
-                              "] is yet to support.");
-          return true;
-        } else
-          Error1(n.LOC(), "MMA [" + STR(ety) + ": " + MMAShapeSTR(mma_shape) +
-                              "] is not support by current architecture(" +
-                              CCtx().GetArch() + ").");
-        break;
-      default:
-        choreo_unreachable(STR(ety) + " is not supported by current MMA");
-        break;
-      }
-#endif
       VST_DEBUG(dbgs() << STR(n) << ", mma_size: " << MMAShapeSTR(mma_shape)
                        << "\n");
     } break;
     case AST::MMAOperation::Store: break;
+    case AST::MMAOperation::Commit: break;
     default: choreo_unreachable("unsupported mma operation.");
     }
     return true;

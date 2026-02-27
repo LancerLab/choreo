@@ -7,111 +7,126 @@
 
 #include <algorithm>
 #include <assert.h>
-#include <cmath>            // For fp16
-#include <cstdint>          // For fixed-width integer types
+#include <cmath>   // For fp16
+#include <cstdint> // For fixed-width integer types
+#include <cstdlib>
 #include <initializer_list> // for std::initializer_list
 #include <iostream>         // report error
 #include <map>
 #include <memory>
 #include <random>
+#include <sstream>
+#include <string>
 
 #if __has_include("private_target0_defines.h")
-#include "private_target0_defines.h"
+  #include "private_target0_defines.h"
 #endif
 
 #ifdef __CHOREO_PRIVATE_TGT0__
 
-#define __CHOREO_TARGET_NATIVE_F16_SUPPORT__
-// #define __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
-#define __co_device__ __device__
-#define __co_host__ __host__
-#define __co_any__ __device__ __host__
+  #define __CHOREO_TARGET_NATIVE_F16_SUPPORT__
+  // #define __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
+  #define __co_device__ __device__
+  #define __co_host__ __host__
+  #define __co_any__ __device__ __host__
 
 #elif defined(__CHOREO_TARGET_CUTE__)
-#ifdef __USE_CUDA_TYPE__
-#include "cuda.h"
-#if CUDA_VERSION >= 11000
-#define __CHOREO_TARGET_NATIVE_F16_SUPPORT__
-#include "cuda_bf16.h"
-#endif
+  #include <cuda_runtime.h>
+  #include <filesystem>
+  #include <fstream>
+  #include <iterator>
+  #include <limits.h>
+  #include <utility>
+  #ifdef __USE_CUDA_TYPE__
+    #include "cuda.h"
+    #if CUDA_VERSION >= 11000
+      #define __CHOREO_TARGET_NATIVE_F16_SUPPORT__
+      #include "cuda_bf16.h"
+    #endif
 
-#define __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
-#include "cuda_fp16.h"
+    #define __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
+    #include "cuda_fp16.h"
 
-#define __CHOREO_TARGET_NATIVE_TF32_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_TF32_SUPPORT__
 
-#if CUDA_VERSION >= 11080
-#define __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
-#if CUDA_VERSION >= 12090
-#define __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
-#endif
-#include "cuda_fp8.h"
+    #if CUDA_VERSION >= 11080
+      #define __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
+      #if CUDA_VERSION >= 12090
+        #define __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
+      #endif
+      #include "cuda_fp8.h"
+    #else
+    /* FP8 native types are only available when compiling for SM90+ targets. */
+    #endif
+
+    #if CUDA_VERSION >= 12090
+      #define __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
+      #define __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
+      #include "cuda_fp4.h"
+      #include "cuda_fp6.h"
+    #else
+      // Fallback to CUTE FP4/FP6 types when CUDA native types are unavailable.
+      #define __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
+      #define __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
+    #endif
+
+    #define __CHOREO_TARGET_NATIVE_SUB_BYTE_INTEGRAL_SUPPORT__
+  #else // __USE_CUTE_TYPE__
+    #define __CHOREO_TARGET_NATIVE_TF32_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_F16_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
+    #define __CHOREO_TARGET_NATIVE_SUB_BYTE_INTEGRAL_SUPPORT__
+  #endif
+
+  #include "cute/tensor.hpp"
+  #include <cuda/barrier>
+  #include <mma.h>
+  #include <unistd.h>
+
+  #define __co_device__ __device__
+  #define __co_host__ __host__
+  #define __co_any__ __device__ __host__
+
 #else
-/* FP8 native types are only available when compiling for SM90+ targets. */
-#endif
 
-#if CUDA_VERSION >= 12090
-#define __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
-#include "cuda_fp4.h"
-#include "cuda_fp6.h"
-#else
-// Fallback to CUTE FP4/FP6 types when CUDA native types are unavailable.
-#define __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
-#endif
-
-#define __CHOREO_TARGET_NATIVE_SUB_BYTE_INTEGRAL_SUPPORT__
-#else // __USE_CUTE_TYPE__
-#define __CHOREO_TARGET_NATIVE_TF32_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_F16_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
-#define __CHOREO_TARGET_NATIVE_SUB_BYTE_INTEGRAL_SUPPORT__
-#endif
-
-#include "cute/tensor.hpp"
-#include <cuda/barrier>
-#include <mma.h>
-
-#define __co_device__ __device__
-#define __co_host__ __host__
-#define __co_any__ __device__ __host__
-
-#else
-
-#define __co_device__
-#define __co_host__
-#define __co_any__
+  #define __co_device__
+  #define __co_host__
+  #define __co_any__
 
 #endif // PRIVATE_TGT0 and CUTE
 
 // private target must not enable native FP8 support
 #if defined(__CHOREO_PRIVATE_TGT0__)
-#ifdef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
-#undef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
-#endif
-#ifdef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
-#undef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
-#endif
+  #ifdef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
+    #undef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
+  #endif
+  #ifdef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
+    #undef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
+  #endif
 #endif
 
 #if __CHOREO_TGT0_ARCH__ == 400
-#define __CHOREO_BLOCK_SINGLE__                                                \
-  threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&                  \
-      subThreadIdx.x == 0 && subThreadIdx.y == 0 && subThreadIdx.z == 0
-#define __CHOREO_GROUP_SINGLE__(GSIZE)                                         \
-  subThreadIdx.x == 0 && subThreadIdx.y == 0 && subThreadIdx.z == 0
+  #define __CHOREO_BLOCK_SINGLE__                                              \
+    threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&                \
+        subThreadIdx.x == 0 && subThreadIdx.y == 0 && subThreadIdx.z == 0
+  #define __CHOREO_GROUP_SINGLE__(GSIZE)                                       \
+    subThreadIdx.x == 0 && subThreadIdx.y == 0 && subThreadIdx.z == 0
 #elif defined(__CHOREO_TARGET_CUTE__)
-#define __CHOREO_BLOCK_SINGLE__                                                \
-  threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0
-#define __CHOREO_GROUP_SINGLE__(GSIZE) (threadIdx.x % GSIZE) == 0
+  #define __CHOREO_BLOCK_SINGLE__                                              \
+    threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0
+  #define __CHOREO_GROUP_SINGLE__ threadIdx.x % 32 == 0
+  #define __CHOREO_GROUPX4_SINGLE__ threadIdx.x % 128 == 0
+  #define __CHOREO_GROUP_ID__                                                  \
+    (threadIdx.x + threadIdx.y * blockDim.x +                                  \
+     threadIdx.z * blockDim.x * blockDim.y) /                                  \
+        32
 #else
-#define __CHOREO_BLOCK_SINGLE__                                                \
-  threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0
-#define __CHOREO_GROUP_SINGLE__ "invalid to use sublocal predicate"
+  #define __CHOREO_BLOCK_SINGLE__                                              \
+    threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0
+  #define __CHOREO_GROUP_SINGLE__ "invalid to use sublocal predicate"
 #endif
 
 #define __cok__ namespace choreo
@@ -322,14 +337,14 @@ using f64 = double;
 using f32 = float;
 
 #ifdef __CHOREO_TARGET_NATIVE_TF32_SUPPORT__
-// TF32 is only used in tensor core in CUDA and CUTE
-#if defined(__USE_CUTE_TYPE__)
+  // TF32 is only used in tensor core in CUDA and CUTE
+  #if defined(__USE_CUTE_TYPE__)
 using cute::tfloat32_t;
-#elif defined(__USE_CUDA_TYPE__)
+  #elif defined(__USE_CUDA_TYPE__)
 using tfloat32_t = nvcuda::wmma::precision::tf32;
-#else
-#error "TF32 type is not supported on this target."
-#endif
+  #else
+    #error "TF32 type is not supported on this target."
+  #endif
 using tf32 = tfloat32_t;
 #endif
 
@@ -495,18 +510,18 @@ inline std::ostream& operator<<(std::ostream& os, const f16& v) {
 }
 
 #else
-#if defined(__USE_CUTE_TYPE__)
+  #if defined(__USE_CUTE_TYPE__)
 using f16 = cute::half_t;
 using half = cute::half_t;
-#elif defined(__USE_CUDA_TYPE__)
+  #elif defined(__USE_CUDA_TYPE__)
 using f16 = __half;
 using half = __half;
-#elif defined(__CHOREO_PRIVATE_TGT0__)
+  #elif defined(__CHOREO_PRIVATE_TGT0__)
 using f16 = __fp16;
 using half = __fp16;
-#else
-#error "half float is not supported on this target."
-#endif
+  #else
+    #error "half float is not supported on this target."
+  #endif
 #endif // __CHOREO_TARGET_NATIVE_F16_SUPPORT__
 
 __co_any__ inline static f16 f32_to_f16(f32 value) {
@@ -627,43 +642,43 @@ inline std::ostream& operator<<(std::ostream& os, const bf16& v) {
 }
 
 #else // __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
-#ifdef __CHOREO_TARGET_CUTE__
-#ifdef __USE_CUTE_TYPE__
+  #ifdef __CHOREO_TARGET_CUTE__
+    #ifdef __USE_CUTE_TYPE__
 using __bf16 = cute::bfloat16_t;
-#else
+    #else
 using __bf16 = __nv_bfloat16;
-#endif
-#endif
+    #endif
+  #endif
 using bf16 = __bf16;
 using bfp16 = __bf16;
 using bfloat16 = __bf16;
 
 __co_any__ inline static bf16 f32_to_bf16(f32 value) {
-#ifdef __USE_CUDA_TYPE__
+  #ifdef __USE_CUDA_TYPE__
   return __float2bfloat16(value);
-#else
+  #else
   return bf16(value);
-#endif
+  #endif
 }
 
 __co_any__ inline static f32 bf16_to_f32(bf16 value) {
-#ifdef __USE_CUDA_TYPE__
+  #ifdef __USE_CUDA_TYPE__
   return __bfloat162float(value);
-#else
+  #else
   return f32(value);
-#endif
+  #endif
 }
 
-// Check for __bf16 support
-#if !defined(__CHOREO_PRIVATE_TGT0__) && !defined(__clang__) &&                \
-    !defined(__GNUC__) && !defined(__CUDACC__)
-#error                                                                         \
-    "Compiler does not support __bf16. Please use a compiler that supports __bf16 or define a fallback type."
-#elif (defined(__clang__) && __clang_major__ < 11) ||                          \
-    (defined(__GNUC__) && __GNUC__ < 11)
-#error                                                                         \
-    "Compiler does not support __bf16. Please use a compiler that supports __bf16 or define a fallback type."
-#endif // defined...
+  // Check for __bf16 support
+  #if !defined(__CHOREO_PRIVATE_TGT0__) && !defined(__clang__) &&              \
+      !defined(__GNUC__) && !defined(__CUDACC__)
+    #error                                                                     \
+        "Compiler does not support __bf16. Please use a compiler that supports __bf16 or define a fallback type."
+  #elif (defined(__clang__) && __clang_major__ < 11) ||                        \
+      (defined(__GNUC__) && __GNUC__ < 11)
+    #error                                                                     \
+        "Compiler does not support __bf16. Please use a compiler that supports __bf16 or define a fallback type."
+  #endif // defined...
 
 #endif // __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
 
@@ -673,38 +688,38 @@ __co_any__ inline static f32 bf16_to_f32(bf16 value) {
 #endif
 
 #ifdef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
-#if defined(__USE_CUTE_TYPE__)
+  #if defined(__USE_CUTE_TYPE__)
 using cute::float_e4m3_t;
 using cute::float_e5m2_t;
 using cute::float_ue4m3_t;
 using cute::float_ue8m0_t;
-#elif defined(__USE_CUDA_TYPE__)
+  #elif defined(__USE_CUDA_TYPE__)
 using float_e4m3_t = __nv_fp8_e4m3;
 using float_e5m2_t = __nv_fp8_e5m2;
-#ifdef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
+    #ifdef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
 using float_ue8m0_t = __nv_fp8_e8m0;
-#else
+    #else
 using float_ue8m0_t =
     choreo::co_native_base; // Placeholder for unsupported type
-#endif
+    #endif
 using float_ue4m3_t =
     choreo::co_native_base; // Placeholder for unsupported type
-#elif defined(__CHOREO_PRIVATE_TGT0__) || __CHOREO_TGT0_ARCH__ >= 400
-// TODO
-#else
-#error "FP8 E4M3 support requires CUTE Target."
-#endif
+  #elif defined(__CHOREO_PRIVATE_TGT0__) || __CHOREO_TGT0_ARCH__ >= 400
+  // TODO
+  #else
+    #error "FP8 E4M3 support requires CUTE Target."
+  #endif
 using f8 = float_e4m3_t; // define f8 as float_e4m3_t
 using f8_e4m3 = float_e4m3_t;
 using f8_e5m2 = float_e5m2_t;
-using f8_ue8m0 = float_ue8m0_t;
 using f8_ue4m3 = float_ue4m3_t;
+using f8_ue8m0 = float_ue8m0_t;
 
-// Minimal arithmetic support for FP8 scalar types.
-// Choreo's codegen may form expressions like `fp8 + fp8` before casting.
-// CUTLASS/CUTE FP8 types and CUDA FP8 types don't consistently provide these
-// operators, so we define them here and return FP32.
-#if defined(__USE_CUDA_TYPE__)
+  // Minimal arithmetic support for FP8 scalar types.
+  // Choreo's codegen may form expressions like `fp8 + fp8` before casting.
+  // CUTLASS/CUTE FP8 types and CUDA FP8 types don't consistently provide these
+  // operators, so we define them here and return FP32.
+  #if defined(__USE_CUDA_TYPE__)
 __host__ __device__ static inline float operator+(__nv_fp8_e4m3 a,
                                                   __nv_fp8_e4m3 b) {
   return float(a) + float(b);
@@ -738,45 +753,45 @@ __host__ __device__ static inline float operator/(__nv_fp8_e5m2 a,
                                                   __nv_fp8_e5m2 b) {
   return float(a) / float(b);
 }
-#endif // __USE_CUDA_TYPE__
+  #endif // __USE_CUDA_TYPE__
 
 #endif // __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
 
 #ifdef __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
-#if defined(__USE_CUTE_TYPE__)
+  #if defined(__USE_CUTE_TYPE__)
 using cute::float_e2m1_t;
-#elif defined(__USE_CUDA_TYPE__)
-#if CUDA_VERSION >= 12090
+  #elif defined(__USE_CUDA_TYPE__)
+    #if CUDA_VERSION >= 12090
 using float_e2m1_t = __nv_fp4_e2m1;
-#else
+    #else
 using float_e2m1_t = cute::float_e2m1_t;
-#endif
-#elif defined(__CHOREO_PRIVATE_TGT0__) || __CHOREO_TGT0_ARCH__ >= 400
-// TODO
-#else
-#error "FP4 is not supported on this target."
-#endif
+    #endif
+  #elif defined(__CHOREO_PRIVATE_TGT0__) || __CHOREO_TGT0_ARCH__ >= 400
+  // TODO
+  #else
+    #error "FP4 is not supported on this target."
+  #endif
 using f4_e2m1_t = float_e2m1_t;
 using f4_e2m1 = float_e2m1_t;
 #endif // __CHOREO_TARGET_NATIVE_FP4_SUPPORT__
 
 #ifdef __CHOREO_TARGET_NATIVE_FP6_SUPPORT__
-#if defined(__USE_CUTE_TYPE__)
+  #if defined(__USE_CUTE_TYPE__)
 using cute::float_e2m3_t;
 using cute::float_e3m2_t;
-#elif defined(__USE_CUDA_TYPE__)
-#if CUDA_VERSION >= 12090
+  #elif defined(__USE_CUDA_TYPE__)
+    #if CUDA_VERSION >= 12090
 using float_e3m2_t = __nv_fp6_e3m2;
 using float_e2m3_t = __nv_fp6_e2m3;
-#else
+    #else
 using float_e3m2_t = cute::float_e3m2_t;
 using float_e2m3_t = cute::float_e2m3_t;
-#endif
-#elif defined(__CHOREO_PRIVATE_TGT0__) || __CHOREO_TGT0_ARCH__ >= 400
-// TODO
-#else
-#error "FP6 is not supported on this target."
-#endif
+    #endif
+  #elif defined(__CHOREO_PRIVATE_TGT0__) || __CHOREO_TGT0_ARCH__ >= 400
+  // TODO
+  #else
+    #error "FP6 is not supported on this target."
+  #endif
 using f6_e3m2_t = float_e3m2_t;
 using f6_e2m3_t = float_e2m3_t;
 using f6_e3m2 = float_e3m2_t;
@@ -797,7 +812,7 @@ using s8 = int8_t;   // 8-bit signed integer
 
 // Sub-Byte integer types
 #ifdef __CHOREO_TARGET_NATIVE_SUB_BYTE_INTEGRAL_SUPPORT__
-#if defined(__USE_CUDA_TYPE__) || defined(__USE_CUTE_TYPE__)
+  #if defined(__USE_CUDA_TYPE__) || defined(__USE_CUTE_TYPE__)
 using cute::bin1_t;
 using cute::int2b_t;
 using cute::int4b_t;
@@ -806,9 +821,9 @@ using cute::uint1b_t;
 using cute::uint2b_t;
 using cute::uint4b_t;
 using cute::uint6b_t;
-#else
-#error "Sub-Byte integer types is not supported on this target."
-#endif
+  #else
+    #error "Sub-Byte integer types is not supported on this target."
+  #endif
 using bin1 = bin1_t;
 using s2 = int2b_t;
 using s4 = int4b_t;
@@ -829,21 +844,21 @@ __co_any__ inline float to_f32(T value) {
 #ifndef __CHOREO_TARGET_NATIVE_F16_SUPPORT__
     return __f16_to_f32<float>(value);
 #else
-#ifdef __USE_CUDA_TYPE__
+  #ifdef __USE_CUDA_TYPE__
     return __half2float(value);
-#else
+  #else
     return static_cast<float>(value);
-#endif
+  #endif
 #endif
   } else if constexpr (std::is_same<T, bf16>::value) {
 #ifndef __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
     return bf16::halfBitsToFloat(value);
 #else
-#ifdef __USE_CUDA_TYPE__
+  #ifdef __USE_CUDA_TYPE__
     return __bfloat162float(value);
-#else
+  #else
     return static_cast<float>(value);
-#endif
+  #endif
 #endif
   } else if constexpr (
 #ifdef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
@@ -918,6 +933,108 @@ verify_matmul_row_row_subset(A& lhs, B& rhs, C& res, float base_tol,
       choreo_assert(std::abs(got - ref) <= tol, "values are not equal.");
     }
 }
+
+// bitcast to uintx_t.
+// The type in is_same is the underlying type not the type alias.
+#if defined(__USE_CUDA_TYPE__)
+template <typename T>
+__host__ __device__ inline auto bitcast_uint(T x) {
+  if constexpr (std::is_same<T, float>::value) return __float_as_uint(x);
+  #if defined(__CHOREO_TARGET_NATIVE_TF32_SUPPORT__)
+  else if constexpr (std::is_same<T, tf32>::value)
+    return __float_as_uint(x);
+  #endif // __CHOREO_TARGET_NATIVE_TF32_SUPPORT__
+  #if defined(__CHOREO_TARGET_NATIVE_F16_SUPPORT__)
+  else if constexpr (std::is_same<T, __half>::value)
+    return __half_as_ushort(x);
+  #endif // __CHOREO_TARGET_NATIVE_F16_SUPPORT__
+  #if defined(__CHOREO_TARGET_NATIVE_BF16_SUPPORT__)
+  else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+    return __bfloat16_as_ushort(x);
+  #endif // __CHOREO_TARGET_NATIVE_BF16_SUPPORT__
+  #if defined(__CHOREO_TARGET_NATIVE_FP8_SUPPORT__)
+  else if constexpr (std::is_same<T, __nv_fp8_e4m3>::value ||
+                     std::is_same<T, __nv_fp8_e5m2>::value)
+    return static_cast<uint8_t>(x.__x);
+  #endif // __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
+  #ifdef __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
+  else if constexpr (std::is_same<T, __nv_fp8_e8m0>::value)
+    return static_cast<uint8_t>(x.__x);
+  #endif // __CHOREO_TARGET_NATIVE_FP8_E8M0_SUPPORT__
+  else if constexpr (std::is_integral_v<T>) {
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4,
+                  "integral T must be 1, 2, or 4 bytes");
+    if constexpr (sizeof(T) == 1)
+      return reinterpret_cast<uint8_t&>(x);
+    else if constexpr (sizeof(T) == 2)
+      return reinterpret_cast<uint16_t&>(x);
+    else
+      return reinterpret_cast<uint32_t&>(x);
+  } else
+    static_assert(sizeof(T) == 0, "Unsupported type for bitcast_uint");
+}
+#endif // defined(__USE_CUDA_TYPE__)
+#if defined(__USE_CUTE_TYPE__)
+template <typename T>
+__host__ __device__ inline auto bitcast_uint(T x) {
+  #if !defined(__CHOREO_TARGET_NATIVE_TF32_SUPPORT__) ||                       \
+      !defined(__CHOREO_TARGET_NATIVE_F16_SUPPORT__) ||                        \
+      !defined(__CHOREO_TARGET_NATIVE_BF16_SUPPORT__) ||                       \
+      !defined(__CHOREO_TARGET_NATIVE_FP8_SUPPORT__)
+    #error "All of the following macros must be defined: \
+__CHOREO_TARGET_NATIVE_TF32_SUPPORT__, \
+__CHOREO_TARGET_NATIVE_F16_SUPPORT__, \
+__CHOREO_TARGET_NATIVE_BF16_SUPPORT__, \
+__CHOREO_TARGET_NATIVE_FP8_SUPPORT__"
+  #endif
+  if constexpr (std::is_same<T, cute::float_e4m3_t>::value ||
+                std::is_same<T, cute::float_e5m2_t>::value ||
+                std::is_same<T, cute::float_ue4m3_t>::value ||
+                std::is_same<T, cute::float_ue8m0_t>::value)
+    return x.raw();
+  else if constexpr (std::is_same<T, cute::half_t>::value ||
+                     std::is_same<T, cute::bfloat16_t>::value)
+    return x.raw();
+  else if constexpr (std::is_same<T, float>::value ||
+                     std::is_same<T, tf32>::value)
+    return __float_as_uint(x);
+  else if constexpr (std::is_integral_v<T>) {
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4,
+                  "integral T must be 1, 2, or 4 bytes");
+    if constexpr (sizeof(T) == 1)
+      return reinterpret_cast<uint8_t&>(x);
+    else if constexpr (sizeof(T) == 2)
+      return reinterpret_cast<uint16_t&>(x);
+    else
+      return reinterpret_cast<uint32_t&>(x);
+  } else
+    static_assert(sizeof(T) == 0, "Unsupported type for bitcast_uint");
+}
+#endif // defined(__USE_CUTE_TYPE__)
+
+#if defined(__CHOREO_TARGET_CUTE__)
+// note: As long as result is of uint32_t type, then always using bitcast_u32
+// will not incur any additional performance overhead.
+template <typename T>
+__host__ __device__ inline uint32_t bitcast_u32(T x) {
+  return uint32_t(bitcast_uint(x));
+}
+
+template <typename T>
+__host__ __device__ constexpr inline uint32_t broadcast_to_u32(T x) {
+  static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4,
+                "T must be 1, 2, or 4 bytes");
+
+  if constexpr (sizeof(T) == 1) {
+    return bitcast_u32(x) * 0x01010101U;
+  } else if constexpr (sizeof(T) == 2) {
+    uint32_t v = bitcast_u32(x);
+    return (v << 16) | v;
+  } else {
+    return bitcast_u32(x);
+  }
+}
+#endif // defined(__CHOREO_TARGET_CUTE__)
 
 namespace utils {
 template <typename U>
@@ -1383,24 +1500,24 @@ auto copy_as_spanned(T* ptr, std::initializer_list<size_t> init) {
 
 namespace utils {
 template <typename U>
-__co_host__ inline U from_f32(float v) {
+__co_any__ inline U from_f32(float v) {
   if constexpr (std::is_same<U, f16>::value) {
     return f16(v);
   } else if constexpr (std::is_same<U, bf16>::value) {
     return bf16(v);
 #ifdef __CHOREO_TARGET_NATIVE_FP8_SUPPORT__
   } else if constexpr (std::is_same<U, f8_e4m3>::value) {
-#ifdef __USE_CUDA_TYPE__
+  #ifdef __USE_CUDA_TYPE__
     return f8_e4m3(v);
-#else
+  #else
     return f8_e4m3(v);
-#endif
+  #endif
   } else if constexpr (std::is_same<U, f8_e5m2>::value) {
-#ifdef __USE_CUDA_TYPE__
+  #ifdef __USE_CUDA_TYPE__
     return f8_e5m2(v);
-#else
+  #else
     return f8_e5m2(v);
-#endif
+  #endif
 #endif
   } else {
     return static_cast<U>(v);
@@ -1975,6 +2092,194 @@ static __attribute__((always_inline)) inline void verify_device_status() {
 #endif
 }
 
+#ifdef __CHOREO_TARGET_CUTE__
+
+struct TimerOption {
+  int warmup = 10;
+  int repeat = 100;
+  bool sync = true;
+};
+
+struct ProfilerOption {
+  int warmup = 10;
+  int repeat = 100;
+  int device = 0;
+  std::string arch;
+  std::string kernel_name;
+  std::string ncu_path;
+  std::string ncu_output = "ncu.txt";
+  std::string ncu_args;
+  bool page_all = true;
+};
+
+namespace detail {
+inline std::string get_env(const char* key) {
+  const char* val = std::getenv(key);
+  return val ? std::string(val) : std::string();
+}
+
+inline bool file_exists(const std::string& path) {
+  std::error_code ec;
+  return !path.empty() && std::filesystem::exists(path, ec);
+}
+
+inline std::string shell_escape(const std::string& input) {
+  std::string out = "'";
+  for (char c : input) {
+    if (c == '\'')
+      out += "'\\''";
+    else
+      out += c;
+  }
+  out += "'";
+  return out;
+}
+
+inline std::string sanitize_filename(const std::string& input) {
+  if (input.empty()) return "kernel";
+  std::string out;
+  out.reserve(input.size());
+  for (char c : input) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_')
+      out.push_back(c);
+    else
+      out.push_back('_');
+  }
+  return out;
+}
+
+inline std::string resolve_ncu_path(const std::string& hint) {
+  if (!hint.empty()) return hint;
+  auto cuda_home = get_env("CUDA_HOME");
+  if (!cuda_home.empty()) {
+    auto candidate = cuda_home + "/bin/ncu";
+    if (file_exists(candidate)) return candidate;
+  }
+  auto cuda_path = get_env("CUDA_PATH");
+  if (!cuda_path.empty()) {
+    auto candidate = cuda_path + "/bin/ncu";
+    if (file_exists(candidate)) return candidate;
+  }
+  return "ncu";
+}
+
+inline std::string self_exe_path() {
+  char buf[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (len <= 0) return "";
+  buf[len] = '\0';
+  return std::string(buf);
+}
+
+inline std::string self_cmdline_tail_escaped() {
+  std::ifstream fs("/proc/self/cmdline", std::ios::binary);
+  if (!fs) return "";
+  std::string data((std::istreambuf_iterator<char>(fs)),
+                   std::istreambuf_iterator<char>());
+  std::string out;
+  std::string cur;
+  size_t arg_idx = 0;
+  for (char ch : data) {
+    if (ch == '\0') {
+      if (arg_idx > 0) {
+        if (!out.empty()) out += " ";
+        out += shell_escape(cur);
+      }
+      cur.clear();
+      ++arg_idx;
+    } else {
+      cur.push_back(ch);
+    }
+  }
+  if (!cur.empty() && arg_idx > 0) {
+    if (!out.empty()) out += " ";
+    out += shell_escape(cur);
+  }
+  return out;
+}
+
+inline std::string query_arch(int device) {
+  cudaDeviceProp prop;
+  cudaError_t err = cudaGetDeviceProperties(&prop, device);
+  if (err != cudaSuccess) return "";
+  std::ostringstream oss;
+  oss << "sm" << prop.major << prop.minor;
+  return oss.str();
+}
+} // namespace detail
+
+template <typename F, typename... Args>
+inline double timing(F&& matmul, const TimerOption& opt, Args&&... args) {
+  int warmup = std::max(0, opt.warmup);
+  int repeat = std::max(1, opt.repeat);
+
+  for (int i = 0; i < warmup; ++i) matmul(std::forward<Args>(args)...);
+
+  if (opt.sync) abend_true(cudaDeviceSynchronize());
+
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  abend_true(cudaEventCreate(&start));
+  abend_true(cudaEventCreate(&stop));
+  abend_true(cudaEventRecord(start));
+  for (int i = 0; i < repeat; ++i) matmul(std::forward<Args>(args)...);
+  abend_true(cudaEventRecord(stop));
+  abend_true(cudaEventSynchronize(stop));
+
+  float elapsed_ms = 0.0f;
+  abend_true(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  abend_true(cudaEventDestroy(start));
+  abend_true(cudaEventDestroy(stop));
+  return static_cast<double>(elapsed_ms) / static_cast<double>(repeat);
+}
+
+template <typename F, typename... Args>
+inline bool profile(F&& matmul, ProfilerOption& opt, Args&&... args) {
+  if (opt.device >= 0) abend_true(cudaSetDevice(opt.device));
+  if (opt.arch.empty()) opt.arch = detail::query_arch(opt.device);
+
+  const char* in_run = std::getenv("CHOREO_PROFILE_RUN");
+  if (in_run && std::string(in_run) == "1") {
+    int warmup = std::max(0, opt.warmup);
+    int repeat = std::max(1, opt.repeat);
+    for (int i = 0; i < warmup; ++i) matmul(std::forward<Args>(args)...);
+    for (int i = 0; i < repeat; ++i) matmul(std::forward<Args>(args)...);
+    abend_true(cudaDeviceSynchronize());
+    return true;
+  }
+
+  std::string ncu = detail::resolve_ncu_path(opt.ncu_path);
+  opt.ncu_path = ncu;
+  std::string exe = detail::self_exe_path();
+  if (exe.empty()) {
+    std::cerr << "[choreo] failed to resolve current executable path.\n";
+    return false;
+  }
+
+  std::string cmd_args = detail::self_cmdline_tail_escaped();
+  std::string out_file = opt.ncu_output;
+  if (out_file.empty() || out_file == "ncu.txt") {
+    std::string kname = detail::sanitize_filename(opt.kernel_name);
+    out_file = kname + ".ncu.txt";
+  }
+  opt.ncu_output = out_file;
+
+  std::ostringstream cmd;
+  cmd << "CHOREO_PROFILE_RUN=1 ";
+  if (opt.device >= 0) cmd << "CUDA_VISIBLE_DEVICES=" << opt.device << " ";
+  cmd << "sudo -E " << detail::shell_escape(ncu) << " ";
+  if (!opt.ncu_args.empty()) cmd << opt.ncu_args << " ";
+  cmd << detail::shell_escape(exe) << " ";
+  if (!cmd_args.empty()) cmd << cmd_args << " ";
+  cmd << "> " << detail::shell_escape(out_file) << " 2>&1";
+
+  int ret = std::system(cmd.str().c_str());
+  return ret == 0;
+}
+
+#endif // __CHOREO_TARGET_CUTE__
+
 // target specific definations
 #ifdef __CHOREO_PRIVATE_TGT0__
 template <typename T>
@@ -2001,11 +2306,11 @@ using choreo::f4_e2m1;
 
 // target specific libraries (non-shared)
 #if __has_include("choreo_cute.h")
-#include "choreo_cute.h"
+  #include "choreo_cute.h"
 #endif
 
 #if __has_include("private_target0_runtime.h")
-#include "private_target0_runtime.h"
+  #include "private_target0_runtime.h"
 #endif
 
 namespace choreo {

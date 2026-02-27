@@ -1223,6 +1223,12 @@ inline Operand operator%(const Operand& vi1, const Operand& vi2) {
   return bop(OpCode::IRES, vi1, vi2)->Normalize();
 }
 
+inline void operator+=(Operand& vi1, const Operand& vi2) { vi1 = vi1 + vi2; }
+inline void operator-=(Operand& vi1, const Operand& vi2) { vi1 = vi1 - vi2; }
+inline void operator*=(Operand& vi1, const Operand& vi2) { vi1 = vi1 * vi2; }
+inline void operator/=(Operand& vi1, const Operand& vi2) { vi1 = vi1 / vi2; }
+inline void operator%=(Operand& vi1, const Operand& vi2) { vi1 = vi1 % vi2; }
+
 inline Operand oc_lt(const Operand& vi1, const Operand& vi2) {
   return bop(OpCode::LT, vi1, vi2)->Normalize();
 }
@@ -1324,6 +1330,14 @@ inline bool is_true(const Operand& oprd) {
 inline bool is_false(const Operand& oprd) {
   if (auto b = dyn_cast<BooleanValue>(oprd))
     if (b->IsFalse()) return true;
+  return false;
+}
+
+inline bool is_pow2(const Operand& vi) {
+  if (auto nv = dyn_cast<NumericValue>(vi)) {
+    auto val = nv->Value();
+    return val > 0 && ((val & (val - 1)) == 0);
+  }
   return false;
 }
 

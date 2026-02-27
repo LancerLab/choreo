@@ -122,11 +122,10 @@ struct FuncTrait {
   bool multiple_parallelby = false;
   bool has_tma = false;
   bool has_async_dma = false;
-  bool has_subbyte_tma = false;
 };
 
 struct MMAInfo {
-  enum Fragment { FRAG_A, FRAG_B, FRAG_C, FRAG_E };
+  enum Fragment { FRAG_UNK, FRAG_A, FRAG_B, FRAG_C, FRAG_E };
   BaseType ty;
   ValueList shape;
   Fragment frag;
@@ -134,6 +133,7 @@ struct MMAInfo {
   bool operator==(MMAInfo i) {
     return ty == i.ty && IsValueListEqual(shape, i.shape) && frag == i.frag;
   }
+  const ValueList& GetShape() const { return shape; }
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MMAInfo& i) {
@@ -144,18 +144,24 @@ inline std::ostream& operator<<(std::ostream& os, const MMAInfo& i) {
 
 struct TMADesc {
 private:
+  std::string tma_name;
   ptr<AST::ChunkAt> from; // shape for the global input/output
   ptr<AST::ChunkAt> to;
   std::string f_sym; // scoped symbol
   std::string t_sym;
   uint16_t idx;
-  int swizzle_value = 0; // Default to NONE (no swizzle)
+  SwizMode swiz_mode = SwizMode::NONE; // Default to no swizzle
+  ParallelLevel pb_level = ParallelLevel::BLOCK;
+  AST::InThreadsBlock* in_thr_block =
+      nullptr; // if the TMA is within an inthreads, record it here
 
 public:
   TMADesc(const ptr<AST::ChunkAt>& f, const ptr<AST::ChunkAt>& t,
-          const std::string& fs, const std::string& ts, int swizzle = 0)
-      : from(f), to(t), f_sym(fs), t_sym(ts), idx(index++),
-        swizzle_value(swizzle) {
+          const std::string& fs, const std::string& ts,
+          SwizMode swizzle = SwizMode::NONE,
+          ParallelLevel pb_lvl = ParallelLevel::BLOCK)
+      : from(f), to(t), f_sym(fs), t_sym(ts), idx(index++), swiz_mode(swizzle),
+        pb_level(pb_lvl) {
     assert(from && to);
     auto fty = GetSpannedType(from->GetType());
     auto tty = GetSpannedType(to->GetType());
@@ -186,11 +192,16 @@ public:
   const ptr<AST::ChunkAt> GetTo() const { return to; }
   const std::string GetFromSymbol() const { return f_sym; }
   const std::string GetToSymbol() const { return t_sym; }
-  int GetSwizzleValue() const { return swizzle_value; }
+  SwizMode GetSwizzleMode() const { return swiz_mode; }
 
   const std::string GetName() const {
     return "__choreo_tma_" + std::to_string(idx);
   }
+
+  ParallelLevel GetPBLevel() const { return pb_level; }
+
+  void SetInThreadsBlock(AST::InThreadsBlock* in) { in_thr_block = in; }
+  AST::InThreadsBlock* GetInThreadsBlock() const { return in_thr_block; }
 
 private:
   static int index;

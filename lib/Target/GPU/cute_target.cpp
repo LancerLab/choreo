@@ -1,4 +1,5 @@
 #include "cute_codegen.hpp"
+#include "dmaconf.hpp"
 #include "gpu_adapt.hpp"
 #include "gpu_target.hpp"
 #include "memcheck.hpp"
@@ -17,6 +18,14 @@ public:
   static TargetID Id() { return reinterpret_cast<TargetID>(&id); }
 
   int DefaultOptLevel(const ArchId&) const override { return 3; }
+
+  const std::set<SwizMode>
+  SupportedSwizzleModes(const ArchId& arch) const override {
+    if (IsFeatureSupported(arch, STR(ChoreoFeature::TMA)))
+      return {SwizMode::NONE, SwizMode::B32, SwizMode::B64, SwizMode::B128};
+    else
+      return {};
+  }
 
   const std::vector<ArchInfo> SupportedArchs() const override {
     return {

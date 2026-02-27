@@ -91,8 +91,8 @@ inline bool LivenessAnalyzer::IsRef(const AST::Node& n) {
 
 bool LivenessAnalyzer::HasStmt(const AST::Node& n) const {
   return isa<AST::NamedTypeDecl>(&n) || isa<AST::NamedVariableDecl>(&n) ||
-         isa<AST::Assignment>(&n) || isa<AST::DMA>(&n) || isa<AST::Wait>(&n) ||
-         isa<AST::Call>(&n) || isa<AST::Rotate>(&n) ||
+         isa<AST::Assignment>(&n) || isa<AST::DMA>(&n) || isa<AST::MMA>(&n) ||
+         isa<AST::Wait>(&n) || isa<AST::Call>(&n) || isa<AST::Rotate>(&n) ||
          isa<AST::Synchronize>(&n) || isa<AST::Trigger>(&n) ||
          isa<AST::Return>(&n) || isa<AST::ParallelBy>(&n) ||
          isa<AST::WithBlock>(&n) || isa<AST::ForeachBlock>(&n) ||
@@ -664,7 +664,8 @@ void LivenessAnalyzer::DumpStmtBriefly(const Stmt& n, std::ostream& os,
         GetSymbolType(nvd->name_str)->Print(os);
       os << " " << nvd->name_str;
       if (nvd->IsArray())
-        for (auto d : nvd->array_dims) os << "[" << d << "]";
+        for (const auto& d : nvd->ArrayDimensions()->AllValues())
+          os << "[" << STR(d) << "]";
     }
     if (nvd->init_expr)
       os << " " << nvd->init_str << " " << PSTR(nvd->init_expr);
@@ -689,6 +690,48 @@ void LivenessAnalyzer::DumpStmtBriefly(const Stmt& n, std::ostream& os,
     if (dma->chained) {
       if (dma->chain_to != "") os << ", chain_to " << dma->chain_to;
       if (dma->chain_from != "") os << ", chain_from " << dma->chain_from;
+    }
+  } else if (const auto mma = dyn_cast<AST::MMA>(&n)) {
+    // TODO: handel swizzle, scale; use values after typeinfer.
+    auto op = mma->GetOperation();
+    auto frag = op->GetFrag();
+    auto sym = AST::FragName(frag);
+    switch (op->Tag()) {
+    case AST::MMAOperation::Fill: {
+      if (op->FillingIsDecl()) {
+        os << PSTR(frag) << " = mma.fill." << STR(op->FillingType()) << " "
+           << PSTR(op->FillingValue());
+      } else {
+        os << " = mma.fill." << STR(op->FillingType()) << " " << PSTR(frag)
+           << ", " << PSTR(op->FillingValue());
+      }
+    } break;
+    case AST::MMAOperation::Load: {
+      os << "mma.load " << (op->IsAsync() ? ".async" : "") << " "
+         << PSTR(op->LoadFrom());
+    } break;
+    case AST::MMAOperation::Exec: {
+      os << "mma.exec";
+      switch (op->GetMethod()) {
+      case AST::MMAOperation::ROW_ROW: os << ".ROW.ROW"; break;
+      case AST::MMAOperation::ROW_COL: os << ".ROW.COL"; break;
+      case AST::MMAOperation::COL_COL: os << ".COL.COL"; break;
+      case AST::MMAOperation::COL_ROW: os << ".COL.ROW"; break;
+      default: choreo_unreachable("unsupported dma execution mode."); break;
+      }
+      if (op->IsSparse()) os << ".SP";
+      if (op->HasScale()) os << ".SCALE";
+      // TODO: missing scale
+      os << " " << op->ExecOperand(0) << ", " << op->ExecOperand(1) << ", "
+         << op->ExecOperand(2);
+    } break;
+    case AST::MMAOperation::Store: {
+      os << "mma.store " << op->StoreFrom() << ", " << PSTR(op->StoreTo());
+    } break;
+    case AST::MMAOperation::Commit: {
+      os << "mma.commit";
+    } break;
+    default: choreo_unreachable("unexpect MMA operation.");
     }
   } else if (const auto w = dyn_cast<AST::Wait>(&n)) {
     os << "wait ";
@@ -750,8 +793,7 @@ void LivenessAnalyzer::DumpStmtBriefly(const Stmt& n, std::ostream& os,
       os << lr->iv->name << "(";
       os << (lr->lbound ? PSTR(lr->lbound) : "") << ":";
       os << (lr->ubound ? PSTR(lr->ubound) : "") << ":";
-      os << (IsValidStride(lr->stride) ? std::to_string(lr->stride) : "")
-         << ")";
+      os << (IsValidStep(lr->step) ? std::to_string(lr->step) : "") << ")";
     }
   } else if (const auto itb = dyn_cast<AST::InThreadsBlock>(&n)) {
     os << "inthreads" << (itb->async ? ".async " : " ") << PSTR(itb->pred);
@@ -806,6 +848,7 @@ inline bool ShouldIndent(const AST::Node& n) {
 }
 
 void LivenessAnalyzer::HandleStmtInBefore(AST::Node& n) {
+  // TODO: add guards to ensure all the AST nodes are covered!
   if (!HasStmt(n)) return;
 
   preorder_stmts.push_back(&n);
@@ -1306,6 +1349,27 @@ bool LivenessAnalyzer::Visit(AST::DMA& n) {
   return true;
 }
 
+bool LivenessAnalyzer::Visit(AST::MMA& n) {
+  TraceEachVisit(n);
+  linfo[current_stmt].buffer_related = true;
+  // TODO: async MMA
+  // TODO: handel swizzle, scale; use values after typeinfer.
+  // TODO: handle fragment liveness (def and use). Only buffer is considered
+  // now.
+  auto op = n.GetOperation();
+  // auto frag = op->GetFragSym();
+  switch (op->Tag()) {
+  case AST::MMAOperation::Fill: break;
+  case AST::MMAOperation::Load: break;
+  case AST::MMAOperation::Exec: break;
+  case AST::MMAOperation::Store: break;
+  case AST::MMAOperation::Commit: break;
+  default: choreo_unreachable("unexpect MMA operation.");
+  }
+
+  return true;
+}
+
 bool LivenessAnalyzer::Visit(AST::ChunkAt& n) {
   TraceEachVisit(n);
   assert(n.sa == nullptr && "after norm, there should be no span_as.");
@@ -1313,9 +1377,9 @@ bool LivenessAnalyzer::Visit(AST::ChunkAt& n) {
   AddUse(current_stmt, n.RefSymbol());
 
   for (auto tsi : n.AllOperations())
-    for (const auto& pos : tsi->GetIndices()) {
-      VST_DEBUG(dbgs() << "chunkat position: " << PSTR(pos) << ".\n");
-      VarSet operands = GetAllSymbolicOperands(pos.get());
+    for (const auto& rfn : tsi->ReferredNodes()) {
+      VST_DEBUG(dbgs() << "chunkat referred node: " << PSTR(rfn) << ".\n");
+      VarSet operands = GetAllSymbolicOperands(rfn.get());
       AddUse(current_stmt, operands);
     }
   return true;

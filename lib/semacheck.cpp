@@ -74,7 +74,8 @@ bool SemaChecker::VisitNode(AST::Expr& n) {
     }
 
     auto dims = arr_ty->Dimensions();
-    int bound = arr_ty->Dimension(subscription_level - 1);
+    const ValueItem& bound_vi = arr_ty->Dimension(subscription_level - 1);
+    int bound = *VIInt(bound_vi);
     auto idx = n.GetR();
 
     // TODO: parallel p by 2 { xxx; dma arr[p] => local; }
@@ -97,7 +98,7 @@ bool SemaChecker::VisitNode(AST::Expr& n) {
     }
 
     // 0 <= index < bound
-    auto asrt0 = sbe::bop(OpCode::LT, index, sbe::nu(bound))->Normalize();
+    auto asrt0 = sbe::bop(OpCode::LT, index, bound_vi)->Normalize();
     auto asrt1 = sbe::bop(OpCode::GE, index, sbe::nu(0))->Normalize();
     assert(IsValidValueItem(asrt0) && IsValidValueItem(asrt1));
 
@@ -329,6 +330,13 @@ bool SemaChecker::VisitNode(AST::SpanAs& n) {
     return false;
   }
 
+  auto p = (sty->IsDense() & nty->IsDense());
+  if (p == Modality::NOT)
+    Error1(n.LOC(), "span_as is applied on non-contiguous spanned data.");
+  else if (p == Modality::MAY)
+    Warning(n.LOC(),
+            "span_as could be applied on non-contiguous spanned data.");
+
   if (!sty->RuntimeShaped() && !nty->RuntimeShaped()) {
     // check if the shape size are same
     if (sty->ElementCount() != nty->ElementCount()) {
@@ -361,16 +369,12 @@ bool SemaChecker::VisitNode(AST::DMA& n) {
 
   // Check swizzle: only report error if swizzle is explicitly specified
   // and we're not in a WGMMA context
-  if (n.IsSwizzleExplicit()) {
+  auto swiz_set = CCtx().TargetSwizzleModes();
+  if (!swiz_set.empty() && !swiz_set.count(n.GetSwizzleMode())) {
     // For now, we just validate the swizzle value is valid (128, 64, or 32)
     // The WGMMA context check will be done in codegen phase
-    int swizzle_val = n.GetSwizzleValue();
-    if (swizzle_val != 0 && swizzle_val != 128 && swizzle_val != 64 &&
-        swizzle_val != 32) {
-      Error1(n.LOC(), "Invalid swizzle value: " + std::to_string(swizzle_val) +
-                          ". Must be 0, 128, 64, or 32.");
-      return false;
-    }
+    Error1(n.LOC(), "Invalid swizzle mode: " + STR(n.GetSwizzleMode()) + ".");
+    return false;
   }
 
   if (n.IsSparse()) {
@@ -424,7 +428,7 @@ bool SemaChecker::VisitNode(AST::DMA& n) {
   auto t_shape = stty->GetShape();
 
   if (n.IsSparse()) {
-    if (!n.GetFrom()->NoTilingOperation() || !n.GetTo()->NoTilingOperation()) {
+    if (!n.GetSrc()->NoTilingOperation() || !n.GetDst()->NoTilingOperation()) {
       Error1(n.LOC(), "Sparse DMA currently requires symbol-to-symbol copy "
                       "with no tiling.");
       return false;
@@ -540,6 +544,35 @@ bool SemaChecker::VisitNode(AST::DMA& n) {
     }
   }
 
+  for (const auto& ca_node : {n.from, n.to}) {
+    const auto& ca = cast<AST::ChunkAt>(ca_node);
+    auto sty = GetSpannedType(GetSymbolType(ca->RefSymbol()));
+    assert(sty);
+    Shape s = sty->GetShape();
+    ValueList strd = sty->GetStrides();
+
+    for (auto& op : ca->AllOperations()) {
+      if (auto rop = dyn_cast<AST::SOP::Reshape>(op)) {
+        switch (IsContiguous(s, strd)) {
+        case Modality::NOT:
+          Warning(rop->LOC(),
+                  "'span_as' is applied to non-contiguous spanned data (" +
+                      STR(s) + " {" + STR(strd) + "}).");
+          break;
+        case Modality::MAY:
+          Warning(rop->LOC(),
+                  "'span_as' may be applied to non-contiguous spanned data (" +
+                      STR(s) + " {" + STR(strd) + "}).");
+          break;
+        case Modality::MUST:
+        default: break;
+        }
+      }
+      s = op->GetBlockShape();
+      strd = op->GetBlockStrides();
+    }
+  }
+#if 0
   // Check if the spanned operations are valid
   for (const auto& ca_node : {n.from, n.to}) {
     const auto& ca = cast<AST::ChunkAt>(ca_node);
@@ -548,11 +581,12 @@ bool SemaChecker::VisitNode(AST::DMA& n) {
     bool has_noncontiguous = false;
     size_t last_tiling = 0;
     for (size_t i = 0; i < ca->OpCount(); ++i)
-      if (!ca->OpAt(i)->SpecifyReshape()) last_tiling = i;
+      if (!isa<AST::SOP::Reshape>(ca->OpAt(i))) last_tiling = i;
     bool has_reshape = false;
     for (size_t i = 0; i < ca->OpCount(); ++i) {
       const auto& sop = ca->OpAt(i);
-      if (ca->OpAt(ca->OpCount() - i - 1)->SpecifyReshape()) has_reshape = true;
+      if (isa<AST::SOP::Reshape>(ca->OpAt(ca->OpCount() - i - 1)))
+        has_reshape = true;
       auto is_contiguous = AST::IsContiguousSOp(*sop, original_shape);
       if (auto val = std::get_if<bool>(&is_contiguous); val && *val == false) {
         has_noncontiguous = true;
@@ -568,12 +602,13 @@ bool SemaChecker::VisitNode(AST::DMA& n) {
                   "The reshape operation inside DMA expression maybe is "
                   "executed on a noncontiguous tiling result.");
       }
-      if (has_noncontiguous && sop->SpecifyReshape())
+      if (has_noncontiguous && isa<AST::SOP::Reshape>(sop))
         Warning(sop->LOC(), "The reshape operation inside DMA expression is "
                             "executed on a noncontiguous tiling result.");
       original_shape = sop->GetBlockShape();
     }
   }
+#endif
 
   return true;
 }
@@ -591,11 +626,11 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
       // Try to find a DMA that writes to this symbol
       // This is a simplified check - in a full implementation, we'd track all
       // DMAs For now, we just validate that the swizzle value is valid
-      int mma_swizzle = op.GetSwizzleValue();
-      if (mma_swizzle != 128 && mma_swizzle != 64 && mma_swizzle != 32) {
-        Error1(n.LOC(), "Invalid swizzle value in MMA load: " +
-                            std::to_string(mma_swizzle) +
-                            ". Must be 128, 64, or 32.");
+      auto mma_swizzle = op.GetSwizzleMode();
+      auto swiz_set = CCtx().TargetSwizzleModes();
+      if (!swiz_set.empty() && !swiz_set.count(mma_swizzle)) {
+        Error1(n.LOC(),
+               "Invalid swizzle value in MMA load: " + STR(mma_swizzle) + ".");
         return false;
       }
 
@@ -605,10 +640,10 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
       // - swizzle(128): TILE_K = 64 (default)
       // - swizzle(64):  TILE_K = 32
       // - swizzle(32):  TILE_K = 16
-      if (mma_swizzle == 64) {
+      if (mma_swizzle == SwizMode::B64) {
         VST_DEBUG(dbgs() << "MMA load with swizzle(64): Consider setting "
                             "TILE_K = 32 for optimal performance\n");
-      } else if (mma_swizzle == 32) {
+      } else if (mma_swizzle == SwizMode::B32) {
         VST_DEBUG(dbgs() << "MMA load with swizzle(32): Consider setting "
                             "TILE_K = 16 for optimal performance\n");
       }
@@ -616,9 +651,9 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
     break;
   }
   case AST::MMAOperation::Exec: {
-    auto& a_sym = op.ExecOperand(1);
-    auto& b_sym = op.ExecOperand(2);
-    auto& c_sym = op.ExecOperand(0);
+    auto& a_sym = AST::FragName(op.ExecOperand(1));
+    auto& b_sym = AST::FragName(op.ExecOperand(2));
+    auto& c_sym = AST::FragName(op.ExecOperand(0));
     auto a_ty = GetSpannedType(GetSymbolType(a_sym));
     auto b_ty = GetSpannedType(GetSymbolType(b_sym));
     auto c_ty = GetSpannedType(GetSymbolType(c_sym));
@@ -658,7 +693,7 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
       if (op.IsSparse() && !shape_match) {
         auto a_k = a_shape.ValueAt(1);
         auto b_k = b_shape.ValueAt(1);
-        auto a_k2 = sbe::bop(OpCode::MULTIPLY, a_k, sbe::nu(2))->Normalize();
+        auto a_k2 = a_k * sbe::nu(2);
         if (sbe::ceq(a_k2, b_k)) sparse_packed_match = true;
       }
       cs_vals.push_back(a_shape.ValueAt(0));
@@ -670,7 +705,7 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
       if (op.IsSparse() && !shape_match) {
         auto a_k = a_shape.ValueAt(1);
         auto b_k = b_shape.ValueAt(0);
-        auto a_k2 = sbe::bop(OpCode::MULTIPLY, a_k, sbe::nu(2))->Normalize();
+        auto a_k2 = a_k * sbe::nu(2);
         if (sbe::ceq(a_k2, b_k)) sparse_packed_match = true;
       }
       cs_vals.push_back(a_shape.ValueAt(0));
@@ -682,7 +717,7 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
       if (op.IsSparse() && !shape_match) {
         auto a_k = a_shape.ValueAt(0);
         auto b_k = b_shape.ValueAt(1);
-        auto a_k2 = sbe::bop(OpCode::MULTIPLY, a_k, sbe::nu(2))->Normalize();
+        auto a_k2 = a_k * sbe::nu(2);
         if (sbe::ceq(a_k2, b_k)) sparse_packed_match = true;
       }
       cs_vals.push_back(a_shape.ValueAt(1));
@@ -694,7 +729,7 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
       if (op.IsSparse() && !shape_match) {
         auto a_k = a_shape.ValueAt(0);
         auto b_k = b_shape.ValueAt(0);
-        auto a_k2 = sbe::bop(OpCode::MULTIPLY, a_k, sbe::nu(2))->Normalize();
+        auto a_k2 = a_k * sbe::nu(2);
         if (sbe::ceq(a_k2, b_k)) sparse_packed_match = true;
       }
       cs_vals.push_back(a_shape.ValueAt(1));
@@ -733,6 +768,7 @@ bool SemaChecker::VisitNode(AST::MMA& n) {
     }
   } break;
   case AST::MMAOperation::Store: break;
+  case AST::MMAOperation::Commit: break;
   default: choreo_unreachable("unsupported mma operation.");
   }
   return true;
@@ -758,7 +794,7 @@ bool SemaChecker::VisitNode(AST::ChunkAt& n) {
 
     // check if any indices are out of bound
     for (size_t i = 0; i < rank; ++i) {
-      int bound = arr_ty->Dimension(i);
+      int bound = *VIInt(arr_ty->Dimension(i));
 
       auto expr = n.indices->ValueAt(i);
       // TODO: improve the out-of-bound check for bounded vars
@@ -780,7 +816,8 @@ bool SemaChecker::VisitNode(AST::ChunkAt& n) {
       }
 
       // 0 <= index < bound
-      auto asrt0 = sbe::bop(OpCode::LT, index, sbe::nu(bound))->Normalize();
+      auto asrt0 =
+          sbe::bop(OpCode::LT, index, arr_ty->Dimension(i))->Normalize();
       auto asrt1 = sbe::bop(OpCode::GE, index, sbe::nu(0))->Normalize();
       assert(IsValidValueItem(asrt0) && IsValidValueItem(asrt1));
 

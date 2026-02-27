@@ -39,9 +39,11 @@ bool ShapeInference::BeforeVisitImpl(AST::Node& n) {
     vn.EnterScope();
     ast_vn.EnterScope();
     cannot_proceed = false; // recover state when starting a new function
-    NumTy valno = GetOrGenValNum(c_sn(1));
-    SymbolAliasNum(InScopeName("@__choreo_no_tiling__"), valno);
-    GetOrGenValNum(s_sn(InScopeName("__choreo_no_tiling__")));
+    SymbolAliasNum(InScopeName("@__choreo_no_tiling__"),
+                   GetOrGenValNum(c_sn(1)));
+    SymbolAliasNum(InScopeName("__choreo_no_tiling__"),
+                   GetOrGenValNum(c_sn(0)));
+    GetOrGenValNum(s_sn(InScopeName("__choreo_parent_dim__")));
     InvalidateVisitorValNOs();
   } else if (isa<AST::ParallelBy>(&n)) {
     vn.EnterScope();
@@ -225,7 +227,20 @@ bool ShapeInference::Visit(AST::MultiValues& n) {
     return true;
   }
 
-  if (gen_values) CollapseMultiValues(n);
+  if (gen_values) {
+    CollapseMultiValues(n);
+    n.Opts().SetVals(vn.GenValueListFromValueNumber(ast_vn.Get(&n)));
+    VST_DEBUG(dbgs() << " |-<exprval> values of multivalues: ["
+                     << STR(n.Opts().GetVals()) << "]\n");
+  }
+
+  if (n.HasNote("array_dims")) {
+    // apply the inferred shape to DataType node.
+    auto nty = NodeType(n);
+    assert(isa<ArrayType>(nty));
+    cast<ArrayType>(nty)->dims = GenShape(GetValNo(n)).Value();
+    SetNodeType(n, nty);
+  }
 
   cur_vn.Invalidate();
 
@@ -270,6 +285,7 @@ bool ShapeInference::Visit(AST::Expr& n) {
     return true;
   }
 
+  if (n.IsReference()) SetNodeType(n, NodeType(*n.GetReference()));
   auto nty = NodeType(n);
   cur_vn = GenValNo(n);
 
@@ -424,6 +440,17 @@ bool ShapeInference::Visit(AST::NamedVariableDecl& n) {
 
   auto& name = n.name_str;
 
+  if (n.IsArray()) {
+    auto array_vn = GetValNo(*n.array_dims);
+    // apply the inferred shape to DataType node.
+    n.type->array_dims = GenShape(array_vn).Value();
+    // special case for event var. Because `CanBeValueNumbered(event)` is false.
+    if (auto eaty = dyn_cast<EventArrayType>(NodeType(*n.type)); eaty) {
+      eaty->dims = n.type->array_dims;
+      SetNodeType(n, eaty);
+    }
+  }
+
   if (!CanBeValueNumbered(&n)) {
     DefineASymbol(name, NodeType(n));
     return true; // mutables and events are not valno-able
@@ -492,10 +519,11 @@ bool ShapeInference::Visit(AST::NamedVariableDecl& n) {
       SymbolAliasNum(SSTab().ScopedName(name + ".span"), cur_mdspan_vn);
       auto mds_value = GenShape(cur_mdspan_vn);
       if (n.IsArray())
-        nty = MakeSpannedArrayType(n.type->base_type, mds_value,
-                                   n.ArrayDimensions(), sto);
+        nty =
+            MakeDenseSpannedArrayType(n.type->base_type, mds_value,
+                                      MakeValueList(n.ArrayDimensions()), sto);
       else
-        nty = MakeSpannedType(n.type->base_type, mds_value, sto);
+        nty = MakeDenseSpannedType(n.type->base_type, mds_value, sto);
     } else if (cur_vn.IsValid()) {
       SymbolAliasNum(SSTab().ScopedName(name), cur_vn);
       nty = NodeType(*n.type);
@@ -747,18 +775,18 @@ bool ShapeInference::Visit(AST::Parameter& n) {
 
       // Put alias names of mdspan into the value number table
       SymbolAliasNum(SSTab().ScopedName(n.sym->name + ".span"), cur_mdspan_vn);
-      SetNodeType(*n.type,
-                  MakeSpannedType(n.type->base_type, span->GetTypeDetail()));
+      SetNodeType(*n.type, MakeDenseSpannedType(n.type->base_type,
+                                                span->GetTypeDetail()));
     } else if (IsValidRank(span->Rank())) {
       cur_mdspan_vn = GetValNo(*span->list, VNKind::VNK_MDSPAN);
       assert(cur_mdspan_vn.IsValid() && "unexpected value number for mdspan.");
       // Put alias names of mdspan into the value number table
       SymbolAliasNum(SSTab().ScopedName(n.sym->name + ".span"), cur_mdspan_vn);
-      SetNodeType(*n.type,
-                  MakeSpannedType(n.type->base_type, span->GetTypeDetail()));
+      SetNodeType(*n.type, MakeDenseSpannedType(n.type->base_type,
+                                                span->GetTypeDetail()));
     } else {
       // the value number is unknown at compile time
-      Error1(n.LOC(), "The type can not be inference at compile time.");
+      Error1(n.LOC(), "The type can not be inferred at compile time.");
       return false;
     }
 
@@ -774,7 +802,7 @@ bool ShapeInference::Visit(AST::Parameter& n) {
     return true;
   }
 
-  if (n.sym && n.type->isScalar()) {
+  if (n.sym && n.type->IsScalar()) {
     assert(!cur_mdspan_vn.IsValid() && "unexpected current mdspan value.");
 
     // get the value number and make it defined
@@ -1000,7 +1028,7 @@ bool ShapeInference::Visit(AST::SpanAs& n) {
   }
 
   auto shape = GenShape(cur_mdspan_vn);
-  auto nty = MakeSpannedType(sty->ElementType(), shape, sty->GetStorage());
+  auto nty = MakeDenseSpannedType(sty->ElementType(), shape, sty->GetStorage());
 
   SetNodeType(n, nty);
   ast_vn.Update(&n, cur_mdspan_vn, VNKind::VNK_MDSPAN);
@@ -1023,11 +1051,20 @@ bool ShapeInference::Visit(AST::DMA& n) {
     return true;
   }
 
-  assert(cur_vn.IsValid() &&
-         "unexpected current value number for shape inference of dma.");
+  // try to report more errors
+  if (!cur_vn.IsValid() && error_count > 0) return false;
 
   if (auto pcfg = dyn_cast<PadConfig>(n.config)) {
     size_t size = pcfg->pad_high->Count();
+
+    auto from_vn = GetValNo(*n.GetFrom(), VNKind::VNK_MDSPAN);
+    auto s_cnt = vn.Flatten(from_vn).size();
+    if (s_cnt != size) {
+      Error1(n.LOC(), "rank mismatch: padding config requires " +
+                          std::to_string(size) + ", but got data ranked " +
+                          std::to_string(s_cnt) + ".");
+      return false;
+    }
 
     auto mss = m_sn();
     for (size_t i = 0; i < size; ++i) {
@@ -1038,8 +1075,18 @@ bool ShapeInference::Visit(AST::DMA& n) {
           vn.MakeOpSign("+", h_l_sig, GetSign(*pcfg->pad_mid->ValueAt(i))));
     }
     // update the cur_vn
-    cur_vn = vn.MakeOpNum("+", cur_vn, GetOrGenValNum(mss));
+    cur_vn = vn.MakeOpNum("+", from_vn, GetOrGenValNum(mss));
   } else if (auto tcfg = dyn_cast<TransposeConfig>(n.config)) {
+    auto size = tcfg->dim_values.size();
+    auto from_vn = GetValNo(*n.GetFrom(), VNKind::VNK_MDSPAN);
+    auto s_cnt = vn.Flatten(from_vn).size();
+    if (s_cnt != size) {
+      Error1(n.LOC(), "rank mismatch: transpose config requires " +
+                          std::to_string(size) + ", but got data ranked " +
+                          std::to_string(s_cnt) + ".");
+      return false;
+    }
+
     // gen new vn if and only if n.to is AST::Memory
     if (isa<AST::Memory>(n.to)) {
       auto& dim_values = tcfg->dim_values;
@@ -1050,10 +1097,20 @@ bool ShapeInference::Visit(AST::DMA& n) {
     }
   }
 
-  auto fsty = GetSpannedType(n.GetFrom()->GetType());
-  // annotate the shape on AST for later type inference
   auto s = GenShape(cur_vn);
-  SetNodeType(n, MakeShapedFutureType(s, n.IsAsync(), fsty->ElementType()));
+  // annotate the shape on AST for later type inference
+  if (n.IsDstInferred()) {
+    auto fsty = GetSpannedType(n.GetFrom()->GetType());
+    auto tsty = MakeDenseSpannedType(fsty->ElementType(), s,
+                                     cast<AST::Memory>(n.GetTo())->Get());
+    SetNodeType(*n.GetTo(), tsty);
+    SetNodeType(n, MakeFutureType(CloneP(tsty), n.IsAsync()));
+  } else {
+    auto tsty = GetSpannedType(n.GetTo()->GetType());
+    assert(tsty);
+    SetNodeType(n, MakeShapedFutureType(s, n.IsAsync(), tsty->GetStrides(),
+                                        tsty->ElementType()));
+  }
 
   if (n.future.empty()) {
     cur_vn.Invalidate();
@@ -1080,38 +1137,55 @@ bool ShapeInference::Visit(AST::DMA& n) {
 
 bool ShapeInference::Visit(AST::MMA& n) {
   TraceEachVisit(n);
+  // NOTE: The node type maybe differ from symbol type!
   auto& op = *n.GetOperation();
   switch (op.Tag()) {
   case AST::MMAOperation::Fill: {
-    auto fill_ty = op.FillingType();
-    if (fill_ty != BaseType::UNKSCALAR) {
-      DefineASymbol(op.FillingSymbol(),
-                    MakeSpannedType(fill_ty, GenUninitShape(), Storage::REG));
-    } else {
-      DefineASymbol(op.FillingSymbol(), MakeDummySpannedType());
+    if (op.FillingIsDecl()) {
+      NumTy array_vn;
+      if (op.FillingArrayDims()) array_vn = GetValNo(*op.FillingArrayDims());
+      std::string fill_sym = AST::FragName(op.FillingTo());
+      auto fill_ty = op.FillingType();
+      if (fill_ty != BaseType::UNKSCALAR) {
+        if (op.FillingArrayDims())
+          DefineASymbol(fill_sym,
+                        MakeUnRankedSpannedArrayType(
+                            fill_ty, GenShape(array_vn).Value(), Storage::REG));
+        else
+          DefineASymbol(fill_sym,
+                        MakeUnRankedSpannedType(fill_ty, Storage::REG));
+      } else {
+        if (op.FillingArrayDims())
+          DefineASymbol(fill_sym,
+                        MakeDummySpannedArrayType(GenShape(array_vn).Value()));
+        else
+          DefineASymbol(fill_sym, MakeDummySpannedType());
+      }
+      DefineASymbol(fill_sym + ".span", MakeUninitMDSpanType());
+      SymbolAliasNoNum(SSTab().InScopeName(fill_sym) +
+                       ".span"); // valno is yet invalid
     }
-    DefineASymbol(op.FillingSymbol() + ".span", MakeUninitMDSpanType());
-    SymbolAliasNoNum(SSTab().InScopeName(op.FillingSymbol()) +
-                     ".span"); // valno is yet invalid
   } break;
   case AST::MMAOperation::Load: {
+    std::string load_to_sym = AST::FragName(op.LoadTo());
     auto fty = cast<SpannedType>(op.LoadFrom()->GetType());
-    auto f_span = op.LoadTo() + ".span";
+    auto f_span = load_to_sym + ".span";
     SymbolAliasNum(SSTab().ScopedName(f_span), cur_vn);
-    auto s =
-        MakeSpannedType(fty->ElementType(), GenShape(cur_vn), Storage::REG);
+    auto s = MakeDenseSpannedType(fty->ElementType(), GenShape(cur_vn),
+                                  Storage::REG);
     auto f = MakeFutureType(s, op.IsAsync());
-    DefineASymbol(op.LoadTo(), f);
+    DefineASymbol(load_to_sym, f);
     DefineASymbol(f_span, s->Clone());
     SetNodeType(n, f);
   } break;
   case AST::MMAOperation::Exec: {
-    auto fty = GetSpannedType(GetSymbolType(op.ExecOperand(1)));
+    std::string op0_sym = AST::FragName(op.ExecOperand(0)); // mc
+    std::string op1_sym = AST::FragName(op.ExecOperand(1)); // ma
+    std::string op2_sym = AST::FragName(op.ExecOperand(2)); // mb
+    auto fty = GetSpannedType(GetSymbolType(op1_sym));
     assert(fty);
-    auto lspan =
-        RemoveSuffix(SSTab().InScopeName(op.ExecOperand(1)), ".data") + ".span";
-    auto rspan =
-        RemoveSuffix(SSTab().InScopeName(op.ExecOperand(2)), ".data") + ".span";
+    auto lspan = RemoveSuffix(SSTab().InScopeName(op1_sym), ".data") + ".span";
+    auto rspan = RemoveSuffix(SSTab().InScopeName(op2_sym), ".data") + ".span";
     auto lsig = cast<MultiSigns>(SymbolSign(lspan));
     auto rsig = cast<MultiSigns>(SymbolSign(rspan));
     auto asig = m_sn();
@@ -1135,11 +1209,11 @@ bool ShapeInference::Visit(AST::MMA& n) {
     default: choreo_unreachable("unsupported mma execution method.");
     }
     cur_vn = GetOrGenValNum(asig);
-    auto mdsym = SSTab().InScopeName(op.ExecOperand(0)) + ".span";
+    auto mdsym = SSTab().InScopeName(op0_sym) + ".span";
     if (!vn.HasValidValueNumberOfSignature(s_sn(mdsym)))
       SymbolAliasNum(mdsym, cur_vn);
     auto mty = MakeMDSpanType(GenShape(cur_vn));
-    auto c_sty = GetSpannedType(GetSymbolType(op.ExecOperand(0)));
+    auto c_sty = GetSpannedType(GetSymbolType(op0_sym));
     auto c_elem = (c_sty && c_sty->ElementType() != BaseType::UNKSCALAR)
                       ? c_sty->ElementType()
                       : fty->ElementType();
@@ -1153,20 +1227,29 @@ bool ShapeInference::Visit(AST::MMA& n) {
           c_elem == BaseType::F8_UE4M3 || c_elem == BaseType::F8_UE8M0;
       if (a_is_fp8 && c_is_fp8) { c_elem = BaseType::F32; }
     }
-    auto sty = MakeSpannedType(c_elem, GenShape(cur_vn), Storage::REG);
-    UpdateSymbolType(op.ExecOperand(0), sty);
-    UpdateSymbolType(op.ExecOperand(0) + ".span", mty);
+    if (AST::FragIsArrayElem(op.ExecOperand(0))) {
+      auto pty = SSTab().LookupSymbol(op0_sym);
+      assert(isa<ArrayType>(pty));
+      auto sty = MakeDenseSpannedArrayType(
+          c_elem, GenShape(cur_vn), GetArrayDimensions(pty), Storage::REG);
+      UpdateSymbolType(op0_sym, sty);
+    } else {
+      auto sty = MakeDenseSpannedType(c_elem, GenShape(cur_vn), Storage::REG);
+      UpdateSymbolType(op0_sym, sty);
+    }
+    UpdateSymbolType(op0_sym + ".span", mty);
 
     // Metadata handling for sparse MMA (operand 3)
-    if (op.IsSparse() && !op.ExecOperand(3).empty()) {
-      auto mdata_sym = op.ExecOperand(3);
+    if (op.IsSparse() && op.ExecOperand(3)) {
+      std::string mdata_sym = AST::FragName(op.ExecOperand(3));
       auto mdata_span =
           RemoveSuffix(SSTab().InScopeName(mdata_sym), ".data") + ".span";
       // We don't necessarily update the result shape based on E,
       // but we ensure it's visited and registered in the valno table if needed.
     }
-
-    SetNodeType(n, sty);
+    auto sym_ty = GetSymbolType(op0_sym);
+    // always set the node type to spannedtype in exec.
+    SetNodeType(n, GetSpannedType(sym_ty)->Clone());
   } break;
   case AST::MMAOperation::Store: {
   } break;
@@ -1188,22 +1271,25 @@ bool ShapeInference::Visit(AST::ChunkAt& n) {
 
   auto sty = GetSpannedType(pty);
 
+  cur_vn = GetValNum(SSTab().InScopeName(span_name));
+
   if (n.NoOperation()) {
     // it is just a symbol reference
-
-    cur_vn = GetValNum(SSTab().InScopeName(span_name));
     auto vl = vn.GenValueListFromValueNumber(cur_vn);
     if (IsValidValueList(vl) && !IsComputable(vl))
       Error1(n.LOC(), "The destination block shape can not be evaluated.");
 
-    auto future_shape = GenShape(cur_vn);
+    auto res_shape = GenShape(cur_vn);
 
     // set the chunkat's type
-    SetNodeType(n,
-                MakeSpannedType(sty->e_type, future_shape, sty->GetStorage()));
+    auto nty = MakeSpannedType(sty->e_type, res_shape, sty->GetStrides(),
+                               sty->GetStorage());
+    SetNodeType(n, nty);
 
-    n.SetBlockShape(future_shape);
+    n.SetBlockShape(nty->GetShape());
+
     assert(n.GetBlockShape().IsValid());
+    ast_vn.Update(&n, cur_vn, VNKind::VNK_MDSPAN);
 
     return true;
   }
@@ -1211,29 +1297,34 @@ bool ShapeInference::Visit(AST::ChunkAt& n) {
   auto data_sig = SymbolSign(SSTab().InScopeName(span_name));
   auto data_vns = vn.Flatten(GetValNum(data_sig));
 
-  std::vector<NumTy> mod_vns;
-  std::vector<NumTy> res_vns;
+  auto data_strd = sty->GetStrides();
+  if (data_vns.size() > 1)
+    assert(!data_strd.empty() && "strides are not obtained.");
 
-  bool is_modspan = false;
   auto cur_vns = data_vns;
+  auto cur_strd = data_strd;
+
+  { // make sure all expressions get the value numbers
+    VST_DEBUG(dbgs() << "+--[" << n.TypeNameString() << ": begin sub-nodes]\n");
+    auto old_gv = gen_values;
+    gen_values = true;
+    for (auto op : n.AllOperations()) op->accept(*this);
+    gen_values = old_gv;
+    VST_DEBUG(dbgs() << "+--[" << n.TypeNameString() << ": end sub-nodes]\n");
+  }
 
   // handle all spanned expressions iteratively
   for (auto op : n.AllOperations()) {
-    mod_vns.clear();
-    res_vns.clear();
 
-    { // make sure all expressions get the value numbers
-      auto old_gv = gen_values;
-      gen_values = true;
-      op->accept(*this);
-      gen_values = old_gv;
-    }
+    std::vector<NumTy> tfs_vns;  // value number of tiling factors
+    std::vector<NumTy> sbs_vns;  // value number of subspan
+    std::vector<NumTy> idx_vns;  // value number of indices
+    std::vector<NumTy> off_vns;  // value number of offsets
+    std::vector<NumTy> stp_vns;  // value number of steps
+    std::vector<NumTy> strd_vns; // value number of strides
 
-    std::vector<NumTy> tfs_vns;
-    std::vector<NumTy> pos_vns;
-
-    if (op->SpecifyReshape()) {
-      auto rshp_vn = GetValNo(*op->RShape());
+    if (auto rop = dyn_cast<AST::SOP::Reshape>(op)) {
+      auto rshp_vn = GetValNo(*rop->GetNewSpan());
       auto rvi = vn.GenValueListFromValueNumber(rshp_vn);
       auto cvi = vn.GenValueListFromSignature(vn.MakePluralSign(cur_vns));
       // check if the mutilplicant is equal
@@ -1254,117 +1345,244 @@ bool ShapeInference::Visit(AST::ChunkAt& n) {
           // TODO: (at semacheck) emit runtime check
         }
       }
-      res_vns = vn.NumVector(SignValNo(rshp_vn));
+      cur_vns = vn.NumVector(SignValNo(rshp_vn));
+      auto bshape = GenShape(vn.MakePluralSign(cur_vns));
+      op->SetBlockShape(bshape);
+      cur_strd = bshape.GenDenseStrides();
+      op->SetBlockStrides(cur_strd);
+      VST_DEBUG(dbgs() << " |-<sop: " << PSTR(op)
+                       << "> block shape: " << STR(bshape)
+                       << ", strides: " << STR(cur_strd) << "\n");
     } else {
-      if (op->MultipleExprs()) {
-        // when the code provides explicit tiling factors or subspan
-        tfs_vns = vn.NumVector(GetValNo(*op->TFSS()));
-        assert(tfs_vns.size() == cur_vns.size());
+      // when the code provides explicit tiling factors or subspan
+      auto tfs = op->GetTilingFactors();
+      auto sbs = op->GetSubSpan();
+      auto idx = op->GetIndices();
+      auto off = op->GetOffsets();
+      auto stp = op->GetSteps();
+      auto strd = op->GetStrides();
+      if (tfs) tfs_vns = vn.Flatten(GetValNo(*tfs));
+      if (sbs) sbs_vns = vn.Flatten(GetValNo(*sbs));
+      if (idx) idx_vns = vn.Flatten(GetValNo(*idx));
+      if (off) off_vns = vn.Flatten(GetValNo(*off));
+      if (stp) stp_vns = vn.Flatten(GetValNo(*stp));
+      if (strd) strd_vns = vn.Flatten(GetValNo(*strd));
+
+      if (sbs)
+        for (size_t index = 0; index < sbs_vns.size(); ++index) {
+          auto sbi = vn.GenValueItemFromValueNumber(sbs_vns[index]);
+          if (STR(sbi) == "::__choreo_parent_dim__") {
+            if (isa<AST::SOP::ModSpan>(op))
+              continue;
+            else
+              sbs_vns[index] = cur_vns[index];
+          }
+        }
+
+      if (tfs) {
+        assert(!sbs && "defining both tilling-factors and subspan.");
+        assert(idx && "not defining indexing.");
+        if (cur_vns.size() != tfs_vns.size()) {
+          Error1(op->LOC(),
+                 "data rank (" + std::to_string(cur_vns.size()) +
+                     ") must be consistent with tiling factor count (" +
+                     std::to_string(tfs_vns.size()) + ").");
+          return false;
+        }
+        for (size_t index = 0; index < cur_vns.size(); ++index) {
+          auto shi = vn.GenValueItemFromValueNumber(cur_vns[index]);
+          auto tfi = vn.GenValueItemFromValueNumber(tfs_vns[index]);
+          if (sbe::ceq(tfi, sbe::nu(0))) {
+            Error1(tfs->ValueAt(index)->LOC(),
+                   "tiling factor can not be zero for dimension " +
+                       std::to_string(index) + ".");
+            return false; // can not continue
+          } else if (sbe::clt(shi, tfi))
+            Error1(tfs->LOC(), "tiling factor exceeds data size (" + STR(tfi) +
+                                   " > " + PSTR(shi) + ") in dimension " +
+                                   std::to_string(index) + ".");
+          sbs_vns.push_back(vn.MakeOpNum("/", cur_vns[index], tfs_vns[index]));
+        }
+      } else if (sbs) {
+        assert(!tfs && "defining both tilling-factors and subspan.");
+        if (cur_vns.size() != sbs_vns.size()) {
+          Error1(op->LOC(), "data rank (" + std::to_string(cur_vns.size()) +
+                                ") must be consistent with subspan rank (" +
+                                std::to_string(sbs_vns.size()) + ").");
+          return false;
+        }
+        for (size_t index = 0; index < cur_vns.size(); ++index) {
+          auto shi = vn.GenValueItemFromValueNumber(cur_vns[index]);
+          auto sbi = vn.GenValueItemFromValueNumber(sbs_vns[index]);
+          if (sbe::ceq(sbi, sbe::nu(0))) {
+            Error1(sbs->LOC(), "subspan dimension " + std::to_string(index) +
+                                   " can not be zero.");
+            return false; // can not continue
+          } else if (sbe::clt(shi, sbi))
+            Error1(sbs->LOC(), "subspan too large for dimension " +
+                                   std::to_string(index) + " (" + STR(sbi) +
+                                   " > " + PSTR(shi) + ").");
+          tfs_vns.push_back(vn.MakeOpNum("/", cur_vns[index], sbs_vns[index]));
+        }
+      }
+
+      if (idx) {
+        if (cur_vns.size() != idx_vns.size()) {
+          Error1(op->LOC(), "data rank (" + std::to_string(cur_vns.size()) +
+                                ") must be consistent with index count (" +
+                                std::to_string(idx_vns.size()) + ").");
+          return false;
+        }
+        for (size_t index = 0; index < cur_vns.size(); ++index) {
+          auto tfi = vn.GenValueItemFromValueNumber(tfs_vns[index]);
+          auto idi = vn.GenValueItemFromValueNumber(idx_vns[index]);
+          if (sbe::clt(tfi, idi))
+            Error1(idx->LOC(), "index out of bounds for dimension " +
+                                   std::to_string(index) + " (" + STR(idi) +
+                                   " >= " + PSTR(tfi) + ").");
+          // TODO: index upper-bound check
+        }
+      }
+
+      if (off) {
+        if (cur_vns.size() != off_vns.size()) {
+          Error1(op->LOC(),
+                 "data rank (" + std::to_string(cur_vns.size()) +
+                     ") must be consistent with offset index count (" +
+                     std::to_string(off_vns.size()) + ").");
+          return false;
+        }
+        for (size_t index = 0; index < cur_vns.size(); ++index) {
+          auto shi = vn.GenValueItemFromValueNumber(cur_vns[index]);
+          auto ofi = vn.GenValueItemFromValueNumber(off_vns[index]);
+          if (sbe::clt(shi, ofi))
+            Error1(off->LOC(), "offset out of bounds for dimension " +
+                                   std::to_string(index) + " (" + STR(ofi) +
+                                   " >= " + PSTR(shi) + ").");
+        }
+      }
+
+      if (stp) {
+        if (stp_vns.size() != cur_strd.size()) {
+          Error1(strd->LOC(), "stepping value count (" +
+                                  std::to_string(strd_vns.size()) +
+                                  ") must be consistent with data (" +
+                                  std::to_string(cur_strd.size()) + ").");
+          return false;
+        }
+
+        for (size_t index = 0; index < stp_vns.size(); ++index) {
+          auto sti = vn.GenValueItemFromValueNumber(stp_vns[index]);
+          if (sbe::ceq(sti, sbe::nu(0)))
+            Note(stp->LOC(), "zero step may be unexpected unless use it "
+                             "intentionally for repeated data access.");
+          cur_strd[index] = cur_strd[index] * sti;
+        }
+      }
+
+      if (strd) {
+        if (strd_vns.size() != cur_strd.size()) {
+          Error1(strd->LOC(), "stride value count (" +
+                                  std::to_string(strd_vns.size()) +
+                                  ") must be consistent with data (" +
+                                  std::to_string(cur_strd.size()) + ").");
+          return false;
+        }
+
+        for (size_t index = 0; index < strd_vns.size(); ++index) {
+          auto sti = vn.GenValueItemFromValueNumber(strd_vns[index]);
+          if (sbe::ceq(sti, sbe::nu(0)))
+            Note(strd->LOC(), "zero stride may be unexpected unless use it "
+                              "intentionally for repeated data access.");
+          cur_strd[index] = sti;
+        }
+      }
+      // update shape and value numbers
+      if (auto mop = dyn_cast<AST::SOP::ModSpan>(op)) {
+        std::vector<NumTy> mod_vns;
+        for (size_t index = 0; index < cur_vns.size(); ++index) {
+          auto shi = vn.GenValueItemFromValueNumber(cur_vns[index]);
+          auto sbi = vn.GenValueItemFromValueNumber(sbs_vns[index]);
+          if (STR(sbi) == "::__choreo_parent_dim__") {
+            mod_vns.push_back(cur_vns[index]); // special handling
+            sbs_vns[index] = cur_vns[index];
+          } else if (sbe::ceq((shi % sbi), sbe::nu(0)))
+            mod_vns.push_back(GetOrGenValNum(c_sn(1))); // avoid 0-dim
+          else
+            mod_vns.push_back(
+                vn.MakeOpNum("%", cur_vns[index], sbs_vns[index]));
+        }
+        // calculate and append the offset when not specified
+        if (!mop->GetIndices()) {
+          auto mv = AST::Make<AST::MultiValues>(mop->LOC());
+          ValueList ovl;
+          for (size_t i = 0; i < tfs_vns.size(); ++i) {
+            auto tfis = vn.GenValueListFromValueNumber(tfs_vns[i]);
+            for (auto tfi : tfis) {
+              auto v = AST::MakeIntExpr(mop->LOC(), -1);
+              v->SetType(MakeIntegerType());
+              v->Opts().SetVal(tfi);
+              mv->Append(v);
+              ovl.push_back(tfi);
+            }
+          }
+          mop->SetIndexNodes(mv);
+          mv->Opts().SetVals(ovl);
+          VST_DEBUG(dbgs() << " |-<exprval> values of modspan offset: ["
+                           << STR(mv->Opts().GetVals()) << "]\n");
+        }
+        cur_vns = mod_vns;
       } else {
-        // or else, the ubounds are tiling factors
-        pos_vns = vn.NumVector(GetValNo(*op->Positions(), VNKind::VNK_UBOUND));
-        assert(cur_vns.size() == pos_vns.size());
+        if (auto sop = dyn_cast<AST::SOP::SubSpan>(op)) {
+          if (!sop->GetIndices()) {
+            auto mv = AST::Make<AST::MultiValues>(sop->LOC());
+            ValueList ovl;
+            for (auto ssp : sop->SubSpanNodes()) {
+              auto sse = cast<AST::Expr>(ssp);
+              assert(sse->Opts().HasVals());
+              for (auto vi : sse->Opts().GetVals()) {
+                auto zero = AST::MakeIntExpr(sop->LOC(), 0);
+                zero->SetType(MakeIntegerType());
+                zero->Opts().SetVal(sbe::nu(0));
+                mv->Append(zero);
+                ovl.push_back(sbe::nu(0));
+              }
+            }
+            sop->SetIndexNodes(mv);
+            mv->Opts().SetVals(ovl);
+            VST_DEBUG(dbgs() << " |-<exprval> values of subspan offset: ["
+                             << STR(mv->Opts().GetVals()) << "]\n");
+          }
+        }
+        cur_vns = sbs_vns;
       }
-
-      for (size_t index = 0; index < cur_vns.size(); ++index) {
-        if (op->OpCode() == AST::SpannedOperation::SUBSPAN) {
-          // block.span = subspan
-          auto lvi = vn.GenValueItemFromValueNumber(cur_vns[index]);
-          auto rvi = vn.GenValueItemFromValueNumber(tfs_vns[index]);
-          if (STR(rvi) == "::__choreo_no_tiling__") {
-            res_vns.push_back(cur_vns[index]);
-            continue;
-          }
-          if (sbe::clt(lvi, rvi))
-            Error1(op->TFSSAt(index)->LOC(),
-                   "the subspan dimension (dim: " + std::to_string(index) +
-                       ") is larger than original (" + STR(rvi) + " > " +
-                       STR(lvi) + ").");
-          res_vns.push_back(tfs_vns[index]);
-        } else if (op->OpCode() == AST::SpannedOperation::MODSPAN) {
-          // block.span = data.span % tiling_factor
-          auto lvi = vn.GenValueItemFromValueNumber(cur_vns[index]);
-          auto rvi = vn.GenValueItemFromValueNumber(tfs_vns[index]);
-          if (STR(rvi) == "::__choreo_no_tiling__") {
-            // special case: x.modspan(_, n).at(...)
-            // the result shape should be [x.span(0), x.span(1)%n]
-            mod_vns.push_back(cur_vns[index]);
-            res_vns.push_back(cur_vns[index]);
-            continue;
-          }
-          if (sbe::clt(lvi, rvi))
-            Error1(op->TFSSAt(index)->LOC(),
-                   "the subspan dimension (dim: " + std::to_string(index) +
-                       ") is larger than the data (" + STR(rvi) + " > " +
-                       PSTR(lvi) + ").");
-          auto mod_vn = vn.MakeOpNum("%", cur_vns[index], tfs_vns[index]);
-          mod_vns.push_back(mod_vn);
-          res_vns.push_back(tfs_vns[index]);
-        } else if (op->OpCode() == AST::SpannedOperation::TILEAT) {
-          // block.span = data.span / tiling_factor
-          auto lvi = vn.GenValueItemFromValueNumber(cur_vns[index]);
-          auto rvi = vn.GenValueItemFromValueNumber(tfs_vns[index]);
-          if (STR(rvi) == "::__choreo_no_tiling__") {
-            res_vns.push_back(cur_vns[index]);
-            continue;
-          }
-          if (sbe::clt(lvi, rvi))
-            Error1(op->TFSSAt(index)->LOC(),
-                   "the tiling factor (dim: " + std::to_string(index) +
-                       ") is larger than the data dimension (" + STR(rvi) +
-                       " > " + PSTR(lvi) + ").");
-          res_vns.push_back(vn.MakeOpNum("/", cur_vns[index], tfs_vns[index]));
-        } else if (op->OpCode() == AST::SpannedOperation::TILING) {
-          // block.span = data.span / #pos
-          auto lvi = vn.GenValueItemFromValueNumber(cur_vns[index]);
-          auto rvi = vn.GenValueItemFromValueNumber(pos_vns[index]);
-          if (sbe::clt(lvi, rvi))
-            Error1(op->LOC(),
-                   "the tiling factor (dim: " + std::to_string(index) +
-                       ") is larger than the data dimension (" + STR(rvi) +
-                       " > " + STR(lvi) + ").");
-          res_vns.push_back(vn.MakeOpNum("/", cur_vns[index], pos_vns[index]));
-        } else
-          choreo_unreachable("unsupported operation.");
-      }
-      assert(res_vns.size() == cur_vns.size());
+      auto block_shape = GenShape(vn.MakePluralSign(sbs_vns));
+      op->SetBlockShape(block_shape);
+      op->SetBlockStrides(cur_strd);
+      VST_DEBUG(dbgs() << " |-<sop: " << PSTR(op)
+                       << "> block shape: " << STR(block_shape)
+                       << ", strides: " << STR(cur_strd) << "\n");
     }
-
-    if (op->OpCode() == AST::SpannedOperation::MODSPAN) {
-      cur_vns = mod_vns;
-      is_modspan = true;
-    } else {
-      cur_vns = res_vns;
-      is_modspan = false;
-    }
-    op->SetBlockShape(GenShape(vn.MakePluralSign(res_vns)));
   }
 
-  Shape block_shape;
-  // generate signature for multi-valnos
-  auto b_sign = vn.MakePluralSign(cur_vns); // signature of the sub-block
-  if (is_modspan) { // remainder value as the current shape value
-    cur_vn = vn.MakePluralNum(mod_vns); // specific for modspan operation
-    auto b_valno = GetValNum(b_sign);
-    block_shape = GenShape(b_valno);
-  } else
-    cur_vn = GetOrGenValNum(b_sign);
-
+  auto psn = vn.MakePluralSign(cur_vns);
+  cur_vn = GetOrGenValNum(psn);
   auto vl = vn.GenValueListFromValueNumber(cur_vn);
   if (IsValidValueList(vl) && !IsComputable(vl))
     Error1(n.LOC(), "The destination block shape can not be evaluated.");
 
-  auto future_shape = GenShape(cur_vn);
+  auto res_shape = GenShape(psn);
 
   // set the chunkat's type
-  SetNodeType(n, MakeSpannedType(sty->e_type, future_shape, sty->GetStorage()));
+  SetNodeType(
+      n, MakeSpannedType(sty->e_type, res_shape, cur_strd, sty->GetStorage()));
+  n.SetBlockShape(res_shape); // TODO: this is redudant
 
-  if (is_modspan)
-    n.SetBlockShape(block_shape);
-  else
-    n.SetBlockShape(future_shape);
+  VST_DEBUG(dbgs() << " |-<output> shape: " << STR(res_shape) << "\n");
 
   assert(n.GetBlockShape().IsValid());
+
+  ast_vn.Update(&n, cur_vn, VNKind::VNK_MDSPAN);
 
   return true;
 }
@@ -1512,8 +1730,7 @@ bool ShapeInference::Visit(AST::Select& n) {
                             ", type0: " + PSTR(s0ty));
         return false;
       }
-      auto nty = MakeSpannedType(sty->e_type, GenShape(cur_mdspan_vn),
-                                 sty->GetStorage());
+      auto nty = NodeType(*n.expr_list->ValueAt(0))->Clone();
       SetNodeType(n, nty);
     }
     ast_vn.Copy(s0.get(), &n, VNKind::VNK_MDSPAN);
@@ -1749,7 +1966,7 @@ bool ShapeInference::CanBeValueNumbered(AST::Node* n) const {
 
   assert(!n->IsBlock() && "do not pass in block node.");
 
-  if (isa<AST::ChunkAt>(n)) return false;
+  // if (isa<AST::ChunkAt>(n)) return false;
   if (isa<AST::StringLiteral>(n)) return false;
   if (isa<AST::DataAccess>(n)) return false;
   if (isa<AST::Call>(n)) return false;
